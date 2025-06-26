@@ -78,7 +78,7 @@ import java.util.Map;
 import java.util.Optional;
 import java.util.stream.Collectors;
 
-import static org.apache.paimon.catalog.Catalog.SYSTEM_TABLE_SPLITTER;
+import static org.apache.paimon.catalog.Identifier.SYSTEM_TABLE_SPLITTER;
 
 /** A {@link Table} for reading audit log of table. */
 public class AuditLogTable implements DataTable, ReadonlyTable {
@@ -370,6 +370,12 @@ public class AuditLogTable implements DataTable, ReadonlyTable {
         }
 
         @Override
+        public SnapshotReader onlyReadRealBuckets() {
+            wrapped.onlyReadRealBuckets();
+            return this;
+        }
+
+        @Override
         public SnapshotReader withBucketFilter(Filter<Integer> bucketFilter) {
             wrapped.withBucketFilter(bucketFilter);
             return this;
@@ -450,8 +456,8 @@ public class AuditLogTable implements DataTable, ReadonlyTable {
         }
 
         @Override
-        public InnerTableScan withMetricsRegistry(MetricRegistry metricsRegistry) {
-            batchScan.withMetricsRegistry(metricsRegistry);
+        public InnerTableScan withMetricRegistry(MetricRegistry metricsRegistry) {
+            batchScan.withMetricRegistry(metricsRegistry);
             return this;
         }
 
@@ -565,8 +571,8 @@ public class AuditLogTable implements DataTable, ReadonlyTable {
         }
 
         @Override
-        public StreamDataTableScan withMetricsRegistry(MetricRegistry metricsRegistry) {
-            streamScan.withMetricsRegistry(metricsRegistry);
+        public StreamDataTableScan withMetricRegistry(MetricRegistry metricsRegistry) {
+            streamScan.withMetricRegistry(metricsRegistry);
             return this;
         }
 

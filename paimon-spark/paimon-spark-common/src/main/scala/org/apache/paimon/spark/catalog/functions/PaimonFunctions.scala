@@ -18,12 +18,15 @@
 
 package org.apache.paimon.spark.catalog.functions
 
+import org.apache.paimon.CoreOptions.BucketFunctionType
+import org.apache.paimon.bucket
 import org.apache.paimon.data.serializer.InternalRowSerializer
 import org.apache.paimon.shade.guava30.com.google.common.collect.{ImmutableList, ImmutableMap}
 import org.apache.paimon.spark.SparkInternalRowWrapper
 import org.apache.paimon.spark.SparkTypeUtils.toPaimonRowType
 import org.apache.paimon.spark.catalog.functions.PaimonFunctions._
-import org.apache.paimon.table.sink.KeyAndBucketExtractor.{bucket, bucketKeyHashCode}
+import org.apache.paimon.table.{BucketMode, FileStoreTable}
+import org.apache.paimon.types.{ArrayType, DataType => PaimonDataType, LocalZonedTimestampType, MapType, RowType, TimestampType}
 import org.apache.paimon.utils.ProjectedRow
 
 import org.apache.spark.sql.catalyst.InternalRow
@@ -33,19 +36,29 @@ import org.apache.spark.sql.types.DataTypes.{IntegerType, StringType}
 
 import javax.annotation.Nullable
 
+import scala.collection.JavaConverters._
+
 object PaimonFunctions {
 
-  val BUCKET: String = "bucket"
+  val PAIMON_BUCKET: String = "bucket"
   val MAX_PT: String = "max_pt"
 
   private val FUNCTIONS = ImmutableMap.of(
-    BUCKET,
-    new BucketFunction,
+    PAIMON_BUCKET,
+    new BucketFunction(BucketFunctionType.DEFAULT),
     MAX_PT,
     new MaxPtFunction
   )
 
+  /** The bucket function type to the function name mapping */
+  private val TYPE_FUNC_MAPPING = ImmutableMap.of(
+    BucketFunctionType.DEFAULT,
+    PAIMON_BUCKET
+  )
+
   val names: ImmutableList[String] = FUNCTIONS.keySet.asList()
+
+  def bucketFunctionName(funcType: BucketFunctionType): String = TYPE_FUNC_MAPPING.get(funcType)
 
   @Nullable
   def load(name: String): UnboundFunction = FUNCTIONS.get(name)
@@ -56,7 +69,9 @@ object PaimonFunctions {
  *
  * params arg0: bucket number, arg1...argn bucket keys.
  */
-class BucketFunction extends UnboundFunction {
+class BucketFunction(bucketFunctionType: BucketFunctionType) extends UnboundFunction {
+
+  private val NAME = "bucket"
 
   override def bind(inputType: StructType): BoundFunction = {
     assert(inputType.fields(0).dataType == IntegerType, "bucket number field must be integer type")
@@ -67,13 +82,15 @@ class BucketFunction extends UnboundFunction {
     val mapping = (1 to bucketKeyRowType.getFieldCount).toArray
     val reusedRow =
       new SparkInternalRowWrapper(-1, inputType, inputType.fields.length)
-
+    val bucketFunc: bucket.BucketFunction =
+      bucket.BucketFunction.create(bucketFunctionType, bucketKeyRowType)
     new ScalarFunction[Int]() {
+
       override def inputTypes: Array[DataType] = inputType.fields.map(_.dataType)
 
       override def resultType: DataType = IntegerType
 
-      override def name: String = BUCKET
+      override def name: String = NAME
 
       override def canonicalName: String = {
         // We have to override this method to make it support canonical equivalent
@@ -81,21 +98,54 @@ class BucketFunction extends UnboundFunction {
       }
 
       override def produceResult(input: InternalRow): Int = {
-        val numberBuckets = input.getInt(0)
-        bucket(
-          bucketKeyHashCode(
-            serializer.toBinaryRow(
-              ProjectedRow.from(mapping).replaceRow(reusedRow.replace(input)))),
-          numberBuckets)
+        bucketFunc.bucket(
+          serializer.toBinaryRow(ProjectedRow.from(mapping).replaceRow(reusedRow.replace(input))),
+          input.getInt(0))
       }
-
       override def isResultNullable: Boolean = false
     }
+
   }
 
   override def description: String = name
 
-  override def name: String = BUCKET
+  override def name: String = NAME
+
+}
+
+object BucketFunction {
+
+  private val SPARK_TIMESTAMP_PRECISION = 6
+
+  def supportsTable(table: FileStoreTable): Boolean = {
+    table.bucketMode match {
+      case BucketMode.HASH_FIXED =>
+        table.schema().logicalBucketKeyType().getFieldTypes.asScala.forall(supportsType)
+      case _ => false
+    }
+  }
+
+  /**
+   * The reason of this is that Spark's timestamp precision is fixed to 6, and in
+   * [[BucketFunction.bind]], we use `InternalRowSerializer(bucketKeyRowType)` to convert paimon
+   * rows, but the `bucketKeyRowType` is derived from Spark's StructType which will lose the true
+   * precision of timestamp, leading to anomalies in bucket calculations.
+   *
+   * todo: find a way get the correct paimon type in BucketFunction, then remove this checker
+   */
+  private def supportsType(t: PaimonDataType): Boolean = t match {
+    case arrayType: ArrayType =>
+      supportsType(arrayType.getElementType)
+    case mapType: MapType =>
+      supportsType(mapType.getKeyType) && supportsType(mapType.getValueType)
+    case rowType: RowType =>
+      rowType.getFieldTypes.asScala.forall(supportsType)
+    case timestamp: TimestampType =>
+      timestamp.getPrecision == SPARK_TIMESTAMP_PRECISION
+    case localZonedTimestamp: LocalZonedTimestampType =>
+      localZonedTimestamp.getPrecision == SPARK_TIMESTAMP_PRECISION
+    case _ => true
+  }
 }
 
 /**

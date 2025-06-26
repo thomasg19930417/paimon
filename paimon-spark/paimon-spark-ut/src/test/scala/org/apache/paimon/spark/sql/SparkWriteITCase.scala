@@ -18,9 +18,11 @@
 
 package org.apache.paimon.spark.sql
 
-import org.apache.paimon.Snapshot
-import org.apache.paimon.io.DataFileMeta
+import org.apache.paimon.CoreOptions.BucketFunctionType
+import org.apache.paimon.catalog.Identifier
+import org.apache.paimon.schema.Schema
 import org.apache.paimon.spark.PaimonSparkTestBase
+import org.apache.paimon.types.DataTypes
 
 import org.apache.spark.SparkConf
 import org.apache.spark.sql.Row
@@ -36,6 +38,12 @@ class SparkWriteWithNoExtensionITCase extends SparkWriteITCase {
   override protected def sparkConf: SparkConf = {
     super.sparkConf.remove("spark.sql.extensions")
     super.sparkConf.set("spark.paimon.requiredSparkConfsCheck.enabled", "false")
+  }
+}
+
+class SparkV2WriteITCase extends SparkWriteITCase {
+  override protected def sparkConf: SparkConf = {
+    super.sparkConf.set("spark.paimon.write.use-v2-write", "true")
   }
 }
 
@@ -261,4 +269,70 @@ class SparkWriteITCase extends PaimonSparkTestBase {
 
     }
   }
+
+  test("Paimon write: write table with timestamp3 bucket key") {
+    withTable("t") {
+      // create timestamp3 table using table api
+      val schema = Schema.newBuilder
+        .column("id", DataTypes.INT)
+        .column("ts3", DataTypes.TIMESTAMP(3))
+        .option("bucket-key", "ts3")
+        .option("bucket", "1024")
+        .option("file.format", "avro")
+        .build
+      paimonCatalog.createTable(Identifier.create(dbName0, "t"), schema, false)
+
+      // insert using table api
+      val table = loadTable("t")
+      val writeBuilder = table.newBatchWriteBuilder
+      val write = writeBuilder.newWrite
+      write.write(
+        GenericRow.of(
+          1,
+          org.apache.paimon.data.Timestamp
+            .fromSQLTimestamp(java.sql.Timestamp.valueOf("2024-01-01 00:00:00"))))
+      val commit = writeBuilder.newCommit
+      commit.commit(write.prepareCommit())
+      commit.close()
+      write.close()
+
+      // write using spark sql
+      sql("INSERT INTO t VALUES (2, TIMESTAMP '2024-01-01 00:00:00')")
+
+      // check bucket id
+      checkAnswer(
+        sql("SELECT ts3, __paimon_bucket FROM t WHERE id = 1"),
+        sql("SELECT ts3, __paimon_bucket FROM t WHERE id = 2")
+      )
+    }
+  }
+
+  BucketFunctionType
+    .values()
+    .foreach(
+      funcType => {
+        test(s"Paimon: Bucket table using $funcType bucket function") {
+          withTable("T") {
+            spark.sql(s"""
+                         |CREATE TABLE T (a INT, b STRING, c INT) TBLPROPERTIES
+                         |('bucket-function.type' = '$funcType',
+                         |'bucket-key' = 'a',
+                         |'bucket' = '4',
+                         |'metadata.stats-mode' = 'none'
+                         |)
+                         |""".stripMargin)
+
+            // disable filter by manifest and let bucket filter work
+            for (i <- 0 until 10) {
+              spark.sql(s"INSERT INTO T (a, b, c) VALUES ($i, '$i', $i)")
+            }
+
+            for (i <- 0 until 10) {
+              val rows = spark.sql(s"SELECT * FROM T where a = $i").collect()
+              Assertions.assertEquals(1, rows.length)
+              Assertions.assertEquals(Row.fromSeq(Seq(i, String.valueOf(i), i)), rows(0))
+            }
+          }
+        }
+      })
 }

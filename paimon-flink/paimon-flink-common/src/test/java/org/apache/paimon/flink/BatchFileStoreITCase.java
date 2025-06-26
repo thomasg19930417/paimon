@@ -25,7 +25,6 @@ import org.apache.paimon.table.Table;
 import org.apache.paimon.table.source.snapshot.TimeTravelUtil;
 import org.apache.paimon.utils.BlockingIterator;
 import org.apache.paimon.utils.DateTimeUtils;
-import org.apache.paimon.utils.SnapshotNotExistException;
 
 import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableList;
 
@@ -120,8 +119,8 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
         assertThatThrownBy(() -> batchSql("SELECT * FROM T /*+ OPTIONS('scan.snapshot-id'='0') */"))
                 .satisfies(
                         anyCauseMatches(
-                                SnapshotNotExistException.class,
-                                "Specified parameter scan.snapshot-id = 0 is not exist, you can set it in range from 1 to 4."));
+                                Exception.class,
+                                "The specified scan snapshotId 0 is out of available snapshotId range [1, 4]."));
 
         assertThatThrownBy(
                         () ->
@@ -129,8 +128,8 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
                                         "SELECT * FROM T /*+ OPTIONS('scan.mode'='from-snapshot-full','scan.snapshot-id'='0') */"))
                 .satisfies(
                         anyCauseMatches(
-                                SnapshotNotExistException.class,
-                                "Specified parameter scan.snapshot-id = 0 is not exist, you can set it in range from 1 to 4."));
+                                Exception.class,
+                                "The specified scan snapshotId 0 is out of available snapshotId range [1, 4]."));
 
         assertThat(
                         batchSql(
@@ -792,5 +791,66 @@ public class BatchFileStoreITCase extends CatalogITCaseBase {
         sql("INSERT INTO test_table VALUES (1, 1)");
         assertThat(sql("SELECT * FROM `test_table$audit_log`"))
                 .containsExactly(Row.of("+I", 1, 1, 2));
+    }
+
+    @Test
+    public void testBinlogTableWithComputedColumn() {
+        sql("CREATE TABLE test_table (a int, b int, c AS a + b);");
+        String ddl = sql("SHOW CREATE TABLE `test_table$binlog`").get(0).getFieldAs(0);
+        assertThat(ddl).doesNotContain("`c` AS `a` + `b`");
+
+        sql("INSERT INTO test_table VALUES (1, 1)");
+        assertThat(sql("SELECT * FROM `test_table$binlog`"))
+                .containsExactly(Row.of("+I", new Integer[] {1}, new Integer[] {1}));
+    }
+
+    @Test
+    public void testBinlogTableWithProjection() {
+        sql("CREATE TABLE test_table (a int, b string);");
+        sql("INSERT INTO test_table VALUES (1, 'A')");
+        assertThat(sql("SELECT * FROM `test_table$binlog`"))
+                .containsExactly(Row.of("+I", new Integer[] {1}, new String[] {"A"}));
+        assertThat(sql("SELECT b FROM `test_table$binlog`"))
+                .containsExactly(Row.of((Object) new String[] {"A"}));
+        assertThat(sql("SELECT rowkind, b FROM `test_table$binlog`"))
+                .containsExactly(Row.of("+I", new String[] {"A"}));
+    }
+
+    @Test
+    public void testBatchReadSourceWithSnapshot() {
+        batchSql("INSERT INTO T VALUES (1, 11, 111), (2, 22, 222), (3, 33, 333), (4, 44, 444)");
+        assertThat(
+                        batchSql(
+                                "SELECT * FROM T /*+ OPTIONS('scan.snapshot-id'='1', 'scan.dedicated-split-generation'='true') */"))
+                .containsExactlyInAnyOrder(
+                        Row.of(1, 11, 111),
+                        Row.of(2, 22, 222),
+                        Row.of(3, 33, 333),
+                        Row.of(4, 44, 444));
+
+        batchSql("INSERT INTO T VALUES (5, 55, 555), (6, 66, 666)");
+        assertThat(
+                        batchSql(
+                                "SELECT * FROM T /*+ OPTIONS('scan.dedicated-split-generation'='true') */"))
+                .containsExactlyInAnyOrder(
+                        Row.of(1, 11, 111),
+                        Row.of(2, 22, 222),
+                        Row.of(3, 33, 333),
+                        Row.of(4, 44, 444),
+                        Row.of(5, 55, 555),
+                        Row.of(6, 66, 666));
+
+        assertThat(
+                        batchSql(
+                                "SELECT * FROM T /*+ OPTIONS('scan.dedicated-split-generation'='true') */ limit 2"))
+                .containsExactlyInAnyOrder(Row.of(1, 11, 111), Row.of(2, 22, 222));
+    }
+
+    @Test
+    public void testBatchReadSourceWithoutSnapshot() {
+        assertThat(
+                        batchSql(
+                                "SELECT * FROM T /*+ OPTIONS('scan.dedicated-split-generation'='true') */"))
+                .hasSize(0);
     }
 }

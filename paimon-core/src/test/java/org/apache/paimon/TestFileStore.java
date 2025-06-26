@@ -217,7 +217,7 @@ public class TestFileStore extends KeyValueFileStore {
                 null,
                 watermark,
                 Collections.emptyList(),
-                (commit, committable) -> commit.commit(committable, Collections.emptyMap()));
+                (commit, committable) -> commit.commit(committable, false));
     }
 
     public List<Snapshot> commitData(
@@ -237,7 +237,7 @@ public class TestFileStore extends KeyValueFileStore {
                 (commit, committable) -> {
                     logOffsets.forEach(
                             (bucket, offset) -> committable.addLogOffset(bucket, offset, false));
-                    commit.commit(committable, Collections.emptyMap());
+                    commit.commit(committable, false);
                 });
     }
 
@@ -291,7 +291,7 @@ public class TestFileStore extends KeyValueFileStore {
                 null,
                 null,
                 Arrays.asList(indexFiles),
-                (commit, committable) -> commit.commit(committable, Collections.emptyMap()));
+                (commit, committable) -> commit.commit(committable, false));
     }
 
     public List<Snapshot> commitDataImpl(
@@ -641,7 +641,7 @@ public class TestFileStore extends KeyValueFileStore {
         boolean changelogDecoupled = changelogManager.earliestLongLivedChangelogId() != null;
 
         Path snapshotPath = snapshotManager.snapshotPath(snapshotId);
-        Snapshot snapshot = Snapshot.fromPath(fileIO, snapshotPath);
+        Snapshot snapshot = SnapshotManager.fromPath(fileIO, snapshotPath);
 
         // snapshot file
         result.add(snapshotPath);

@@ -21,9 +21,6 @@ package org.apache.paimon.schema;
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.CoreOptions.ChangelogProducer;
 import org.apache.paimon.CoreOptions.MergeEngine;
-import org.apache.paimon.casting.CastExecutor;
-import org.apache.paimon.casting.CastExecutors;
-import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.format.FileFormat;
 import org.apache.paimon.options.ConfigOption;
 import org.apache.paimon.options.Options;
@@ -38,7 +35,6 @@ import org.apache.paimon.types.MapType;
 import org.apache.paimon.types.MultisetType;
 import org.apache.paimon.types.RowType;
 import org.apache.paimon.types.TimestampType;
-import org.apache.paimon.types.VarCharType;
 import org.apache.paimon.utils.StringUtils;
 
 import java.util.ArrayList;
@@ -104,8 +100,6 @@ public class SchemaValidation {
         CoreOptions options = new CoreOptions(schema.options());
 
         validateBucket(schema, options);
-
-        validateDefaultValues(schema);
 
         validateStartupMode(options);
 
@@ -173,7 +167,10 @@ public class SchemaValidation {
 
         if (schema.primaryKeys().isEmpty() && options.streamingReadOverwrite()) {
             throw new RuntimeException(
-                    "Doesn't support streaming read the changes from overwrite when the primary keys are not defined.");
+                    String.format(
+                            "Doesn't support streaming read the changes from overwrite when the primary keys are "
+                                    + "not defined. Please use %s to enable the streaming read overwrite commit for append table.",
+                            CoreOptions.STREAMING_READ_APPEND_OVERWRITE.key()));
         }
 
         if (schema.options().containsKey(CoreOptions.PARTITION_EXPIRATION_TIME.key())) {
@@ -483,64 +480,6 @@ public class SchemaValidation {
         }
     }
 
-    private static void validateDefaultValues(TableSchema schema) {
-        CoreOptions coreOptions = new CoreOptions(schema.options());
-        Map<String, String> defaultValues = coreOptions.getFieldDefaultValues();
-
-        if (!defaultValues.isEmpty()) {
-
-            List<String> partitionKeys = schema.partitionKeys();
-            for (String partitionKey : partitionKeys) {
-                if (defaultValues.containsKey(partitionKey)) {
-                    throw new IllegalArgumentException(
-                            String.format(
-                                    "Partition key %s should not be assign default column.",
-                                    partitionKey));
-                }
-            }
-
-            List<String> primaryKeys = schema.primaryKeys();
-            for (String primaryKey : primaryKeys) {
-                if (defaultValues.containsKey(primaryKey)) {
-                    throw new IllegalArgumentException(
-                            String.format(
-                                    "Primary key %s should not be assign default column.",
-                                    primaryKey));
-                }
-            }
-
-            List<DataField> fields = schema.fields();
-
-            for (DataField field : fields) {
-                String defaultValueStr = defaultValues.get(field.name());
-                if (defaultValueStr == null) {
-                    continue;
-                }
-
-                @SuppressWarnings("unchecked")
-                CastExecutor<Object, Object> resolve =
-                        (CastExecutor<Object, Object>)
-                                CastExecutors.resolve(VarCharType.STRING_TYPE, field.type());
-                if (resolve == null) {
-                    throw new IllegalArgumentException(
-                            String.format(
-                                    "The column %s with datatype %s is currently not supported for default value.",
-                                    field.name(), field.type().asSQLString()));
-                }
-
-                try {
-                    resolve.cast(BinaryString.fromString(defaultValueStr));
-                } catch (Exception e) {
-                    throw new IllegalArgumentException(
-                            String.format(
-                                    "The default value %s of the column %s can not be cast to datatype: %s",
-                                    defaultValueStr, field.name(), field.type()),
-                            e);
-                }
-            }
-        }
-    }
-
     private static void validateForDeletionVectors(CoreOptions options) {
         checkArgument(
                 options.changelogProducer() == ChangelogProducer.NONE
@@ -604,7 +543,7 @@ public class SchemaValidation {
             if (schema.primaryKeys().isEmpty()
                     && options.toMap().get(FULL_COMPACTION_DELTA_COMMITS.key()) != null) {
                 throw new RuntimeException(
-                        "AppendOnlyTable of unware or dynamic bucket does not support 'full-compaction.delta-commits'");
+                        "AppendOnlyTable of unaware or dynamic bucket does not support 'full-compaction.delta-commits'");
             }
         } else if (bucket < 1 && !isPostponeBucketTable(schema, bucket)) {
             throw new RuntimeException("The number of buckets needs to be greater than 0.");

@@ -22,14 +22,14 @@ import org.apache.paimon.CoreOptions;
 import org.apache.paimon.manifest.PartitionEntry;
 import org.apache.paimon.operation.DefaultValueAssigner;
 import org.apache.paimon.predicate.Predicate;
+import org.apache.paimon.schema.TableSchema;
+import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.source.snapshot.SnapshotReader;
 import org.apache.paimon.table.source.snapshot.StartingScanner;
 import org.apache.paimon.table.source.snapshot.StartingScanner.ScannedResult;
 
 import java.util.ArrayList;
 import java.util.List;
-
-import static org.apache.paimon.CoreOptions.MergeEngine.FIRST_ROW;
 
 /** {@link TableScan} implementation for batch planning. */
 public class DataTableBatchScan extends AbstractDataTableScan {
@@ -42,20 +42,26 @@ public class DataTableBatchScan extends AbstractDataTableScan {
     private Integer pushDownLimit;
 
     public DataTableBatchScan(
-            boolean pkTable,
+            TableSchema schema,
             CoreOptions options,
             SnapshotReader snapshotReader,
-            DefaultValueAssigner defaultValueAssigner) {
-        super(options, snapshotReader);
+            TableQueryAuth queryAuth) {
+        super(schema, options, snapshotReader, queryAuth);
+
         this.hasNext = true;
-        this.defaultValueAssigner = defaultValueAssigner;
-        if (pkTable && (options.deletionVectorsEnabled() || options.mergeEngine() == FIRST_ROW)) {
+        this.defaultValueAssigner = DefaultValueAssigner.create(schema);
+
+        if (!schema.primaryKeys().isEmpty() && options.batchScanSkipLevel0()) {
             snapshotReader.withLevelFilter(level -> level > 0).enableValueFilter();
+        }
+        if (options.bucket() == BucketMode.POSTPONE_BUCKET) {
+            snapshotReader.onlyReadRealBuckets();
         }
     }
 
     @Override
     public InnerTableScan withFilter(Predicate predicate) {
+        super.withFilter(predicate);
         snapshotReader.withFilter(defaultValueAssigner.handlePredicate(predicate));
         return this;
     }
@@ -68,6 +74,8 @@ public class DataTableBatchScan extends AbstractDataTableScan {
 
     @Override
     public TableScan.Plan plan() {
+        authQuery();
+
         if (startingScanner == null) {
             startingScanner = createStartingScanner(false);
         }

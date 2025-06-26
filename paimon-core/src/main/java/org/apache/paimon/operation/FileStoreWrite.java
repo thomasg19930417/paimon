@@ -76,10 +76,6 @@ public interface FileStoreWrite<T> extends Restorable<List<FileStoreWrite.State<
     /**
      * Ignores the check that the written partition must have the same number of buckets with the
      * table option.
-     *
-     * <p>TODO: to support writing partitions with different total buckets, we'll also need a
-     * special {@link org.apache.paimon.table.sink.ChannelComputer} and {@link
-     * org.apache.paimon.table.sink.KeyAndBucketExtractor} to deal with different bucket numbers.
      */
     void withIgnoreNumBucketCheck(boolean ignoreNumBucketCheck);
 
@@ -94,15 +90,6 @@ public interface FileStoreWrite<T> extends Restorable<List<FileStoreWrite.State<
     FileStoreWrite<T> withMetricRegistry(MetricRegistry metricRegistry);
 
     void withCompactExecutor(ExecutorService compactExecutor);
-
-    /**
-     * This method is called when the insert only status of the records changes.
-     *
-     * @param insertOnly If true, all the following records would be of {@link
-     *     org.apache.paimon.types.RowKind#INSERT}, and no two records would have the same primary
-     *     key.
-     */
-    void withInsertOnly(boolean insertOnly);
 
     /**
      * Write the data to the store according to the partition and bucket.

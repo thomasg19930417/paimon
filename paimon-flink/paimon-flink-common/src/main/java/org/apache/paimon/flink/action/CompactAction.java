@@ -270,6 +270,7 @@ public class CompactAction extends TableActionBase {
             Iterator<ManifestEntry> it =
                     table.newSnapshotReader()
                             .withPartitionFilter(Collections.singletonList(partition))
+                            .onlyReadRealBuckets()
                             .readFileIterator();
             if (it.hasNext()) {
                 bucketNum = it.next().totalBuckets();
@@ -284,12 +285,8 @@ public class CompactAction extends TableActionBase {
             Pair<DataStream<RowData>, DataStream<Committable>> sourcePair =
                     PostponeBucketCompactSplitSource.buildSource(
                             env,
-                            realTable.fullName() + partitionSpec,
-                            realTable.rowType(),
-                            realTable
-                                    .newReadBuilder()
-                                    .withPartitionFilter(partitionSpec)
-                                    .withBucket(BucketMode.POSTPONE_BUCKET),
+                            realTable,
+                            partitionSpec,
                             options.get(FlinkConnectorOptions.SCAN_PARALLELISM));
 
             DataStream<InternalRow> partitioned =

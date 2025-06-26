@@ -20,6 +20,7 @@ package org.apache.paimon.catalog;
 
 import org.apache.paimon.CoreOptions;
 import org.apache.paimon.PagedList;
+import org.apache.paimon.TableType;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.fs.FileIO;
@@ -49,6 +50,7 @@ import org.apache.paimon.shade.guava30.com.google.common.collect.Lists;
 import org.apache.paimon.shade.guava30.com.google.common.collect.Maps;
 
 import org.junit.jupiter.api.AfterEach;
+import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.BeforeEach;
 import org.junit.jupiter.api.Test;
 import org.junit.jupiter.api.io.TempDir;
@@ -370,6 +372,44 @@ public abstract class CatalogTestBase {
     }
 
     @Test
+    public void testListTablesPagedGlobally() throws Exception {
+        // List table paged globally throws UnsupportedOperationException if current catalog does
+        // not
+        // supportsListObjectsPaged or current catalog does not supportsListByPattern
+        String databaseName = "list_tables_paged_globally_db";
+        catalog.createDatabase(databaseName, false);
+        if (!catalog.supportsListObjectsPaged() || !catalog.supportsListByPattern()) {
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listTablesPagedGlobally(databaseName, null, null, null));
+        }
+
+        String[] tableNames = {"table1", "table2", "table3", "abd", "def", "opr"};
+        for (String tableName : tableNames) {
+            catalog.createTable(
+                    Identifier.create(databaseName, tableName), DEFAULT_TABLE_SCHEMA, false);
+        }
+
+        if (!catalog.supportsListObjectsPaged() || !catalog.supportsListByPattern()) {
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listTablesPagedGlobally(null, null, null, null));
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listTablesPagedGlobally(databaseName, null, null, null));
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listTablesPagedGlobally(null, null, 100, null));
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listTablesPagedGlobally(databaseName, "abc", null, null));
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listTablesPagedGlobally(databaseName, "abc", null, "table"));
+        }
+    }
+
+    @Test
     public void testCreateTable() throws Exception {
         catalog.createDatabase("test_db", false);
         // Create table creates a new table when it does not exist
@@ -398,6 +438,17 @@ public abstract class CatalogTestBase {
                 .isThrownBy(() -> catalog.createTable(identifier, schema, false))
                 .withMessage("The value of auto-create property should be false.");
         schema.options().remove(CoreOptions.AUTO_CREATE.key());
+
+        // Create table throws Exception when type = format-table.
+        if (supportsFormatTable()) {
+            schema.options().put(CoreOptions.TYPE.key(), TableType.FORMAT_TABLE.toString());
+            schema.options().put(CoreOptions.PRIMARY_KEY.key(), "a");
+            assertThatExceptionOfType(IllegalArgumentException.class)
+                    .isThrownBy(() -> catalog.createTable(identifier, schema, false))
+                    .withMessage("Cannot define primary-key for format table.");
+            schema.options().remove(CoreOptions.TYPE.key());
+            schema.options().remove(CoreOptions.PRIMARY_KEY.key());
+        }
 
         // Create table and check the schema
         schema.options().put("k1", "v1");
@@ -974,6 +1025,13 @@ public abstract class CatalogTestBase {
 
         catalog.alterTable(
                 identifier,
+                Lists.newArrayList(
+                        SchemaChange.setOption(
+                                CoreOptions.DISABLE_ALTER_COLUMN_NULL_TO_NOT_NULL.key(), "false")),
+                false);
+
+        catalog.alterTable(
+                identifier,
                 Lists.newArrayList(SchemaChange.updateColumnNullability("col1", false)),
                 false);
 
@@ -1204,6 +1262,47 @@ public abstract class CatalogTestBase {
                         () ->
                                 catalog.listViewDetailsPaged(
                                         "non_existing_db", finalMaxResults, pageToken, null));
+    }
+
+    @Test
+    public void testListViewsPagedGlobally() throws Exception {
+        if (!supportsView()) {
+            return;
+        }
+
+        // List view paged globally throws UnsupportedOperationException if current catalog does not
+        // supportsListObjectsPaged or odes not supportsListByPattern
+        String databaseName = "list_views_paged_globally_db";
+        catalog.createDatabase(databaseName, false);
+        if (!catalog.supportsListObjectsPaged() || !catalog.supportsListByPattern()) {
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listViewsPagedGlobally(databaseName, null, null, null));
+        }
+
+        View view = buildView(databaseName);
+        String[] viewNames = {"view1", "view2", "view3", "abd", "def", "opr"};
+        for (String viewName : viewNames) {
+            catalog.createView(Identifier.create(databaseName, viewName), view, false);
+        }
+
+        if (!catalog.supportsListObjectsPaged() || !catalog.supportsListByPattern()) {
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listViewsPagedGlobally(null, null, null, null));
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listViewsPagedGlobally(databaseName, null, null, null));
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listViewsPagedGlobally(null, null, 100, null));
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listViewsPagedGlobally(databaseName, "abc", null, null));
+            Assertions.assertThrows(
+                    UnsupportedOperationException.class,
+                    () -> catalog.listViewsPagedGlobally(databaseName, "abc", null, "view"));
+        }
     }
 
     @Test

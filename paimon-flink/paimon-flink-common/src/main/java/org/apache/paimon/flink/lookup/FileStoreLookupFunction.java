@@ -30,9 +30,9 @@ import org.apache.paimon.flink.utils.RuntimeContextUtils;
 import org.apache.paimon.flink.utils.TableScanUtils;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.predicate.Predicate;
-import org.apache.paimon.table.BucketMode;
 import org.apache.paimon.table.FileStoreTable;
 import org.apache.paimon.table.source.OutOfRangeException;
+import org.apache.paimon.types.RowType;
 import org.apache.paimon.utils.FileIOUtils;
 import org.apache.paimon.utils.Filter;
 import org.apache.paimon.utils.Preconditions;
@@ -70,8 +70,8 @@ import static org.apache.paimon.CoreOptions.CONTINUOUS_DISCOVERY_INTERVAL;
 import static org.apache.paimon.flink.FlinkConnectorOptions.LOOKUP_CACHE_MODE;
 import static org.apache.paimon.flink.FlinkConnectorOptions.LOOKUP_REFRESH_TIME_PERIODS_BLACKLIST;
 import static org.apache.paimon.flink.query.RemoteTableQuery.isRemoteServiceAvailable;
-import static org.apache.paimon.lookup.RocksDBOptions.LOOKUP_CACHE_ROWS;
-import static org.apache.paimon.lookup.RocksDBOptions.LOOKUP_CONTINUOUS_DISCOVERY_INTERVAL;
+import static org.apache.paimon.lookup.rocksdb.RocksDBOptions.LOOKUP_CACHE_ROWS;
+import static org.apache.paimon.lookup.rocksdb.RocksDBOptions.LOOKUP_CONTINUOUS_DISCOVERY_INTERVAL;
 import static org.apache.paimon.predicate.PredicateBuilder.transformFieldMapping;
 
 /** A lookup {@link TableFunction} for file store. */
@@ -117,19 +117,20 @@ public class FileStoreLookupFunction implements Serializable, Closeable {
         this.partitionLoader = DynamicPartitionLoader.of(table);
 
         // join keys are based on projection fields
+        RowType rowType = table.rowType();
         this.joinKeys =
                 Arrays.stream(joinKeyIndex)
-                        .mapToObj(i -> table.rowType().getFieldNames().get(projection[i]))
+                        .mapToObj(i -> rowType.getFieldNames().get(projection[i]))
                         .collect(Collectors.toList());
 
         this.projectFields =
                 Arrays.stream(projection)
-                        .mapToObj(i -> table.rowType().getFieldNames().get(i))
+                        .mapToObj(i -> rowType.getFieldNames().get(i))
                         .collect(Collectors.toList());
 
         this.projectFieldsGetters =
                 Arrays.stream(projection)
-                        .mapToObj(i -> table.rowType().fieldGetters()[i])
+                        .mapToObj(i -> InternalRow.createFieldGetter(rowType.getTypeAt(i), i))
                         .collect(Collectors.toList());
 
         // add primary keys
@@ -197,11 +198,11 @@ public class FileStoreLookupFunction implements Serializable, Closeable {
                                     table, projection, path, joinKeys, getRequireCachedBucketIds());
                     LOG.info(
                             "Remote service isn't available. Created PrimaryKeyPartialLookupTable with LocalQueryExecutor.");
-                } catch (UnsupportedOperationException ignore) {
+                } catch (UnsupportedOperationException e) {
                     LOG.info(
                             "Remote service isn't available. Cannot create PrimaryKeyPartialLookupTable with LocalQueryExecutor "
-                                    + "because bucket mode isn't {}. Will create FullCacheLookupTable.",
-                            BucketMode.HASH_FIXED);
+                                    + "because {}. Will create FullCacheLookupTable.",
+                            e.getMessage());
                 }
             }
         }

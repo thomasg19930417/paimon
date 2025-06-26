@@ -25,49 +25,38 @@ import org.apache.paimon.crosspartition.{IndexBootstrap, KeyPartOrRow}
 import org.apache.paimon.data.serializer.InternalSerializers
 import org.apache.paimon.deletionvectors.DeletionVector
 import org.apache.paimon.deletionvectors.append.BaseAppendDeleteFileMaintainer
-import org.apache.paimon.fs.Path
 import org.apache.paimon.index.{BucketAssigner, SimpleHashBucketAssigner}
 import org.apache.paimon.io.{CompactIncrement, DataIncrement, IndexIncrement}
 import org.apache.paimon.manifest.FileKind
 import org.apache.paimon.spark.{SparkRow, SparkTableWrite, SparkTypeUtils}
+import org.apache.paimon.spark.catalog.functions.BucketFunction
 import org.apache.paimon.spark.schema.SparkSystemColumns.{BUCKET_COL, ROW_KIND_COL}
 import org.apache.paimon.spark.util.OptionUtils.paimonExtensionEnabled
 import org.apache.paimon.spark.util.SparkRowUtils
+import org.apache.paimon.spark.write.WriteHelper
 import org.apache.paimon.table.BucketMode._
 import org.apache.paimon.table.FileStoreTable
 import org.apache.paimon.table.sink._
 import org.apache.paimon.types.{RowKind, RowType}
-import org.apache.paimon.utils.{InternalRowPartitionComputer, PartitionPathUtils, PartitionStatisticsReporter, SerializationUtils}
+import org.apache.paimon.utils.SerializationUtils
 
 import org.apache.spark.{Partitioner, TaskContext}
 import org.apache.spark.rdd.RDD
 import org.apache.spark.sql.{DataFrame, Dataset, Row, SparkSession}
 import org.apache.spark.sql.functions._
-import org.slf4j.LoggerFactory
 
 import java.io.IOException
 import java.util.Collections.singletonMap
 
 import scala.collection.JavaConverters._
 
-case class PaimonSparkWriter(table: FileStoreTable) {
+case class PaimonSparkWriter(table: FileStoreTable) extends WriteHelper {
 
   private lazy val tableSchema = table.schema
 
   private lazy val rowType = table.rowType()
 
   private lazy val bucketMode = table.bucketMode
-
-  private lazy val disableReportStats = {
-    val options = table.coreOptions()
-    val config = options.toConfiguration
-    config.get(CoreOptions.PARTITION_IDLE_TIME_TO_REPORT_STATISTIC).toMillis <= 0 ||
-    table.partitionKeys.isEmpty ||
-    !options.partitionedTableInMetastore ||
-    table.catalogEnvironment.partitionHandler() == null
-  }
-
-  private lazy val log = LoggerFactory.getLogger(classOf[PaimonSparkWriter])
 
   @transient private lazy val serializer = new CommitMessageSerializer
 
@@ -163,7 +152,7 @@ case class PaimonSparkWriter(table: FileStoreTable) {
       case CROSS_PARTITION =>
         // Topology: input -> bootstrap -> shuffle by key hash -> bucket-assigner -> shuffle by partition & bucket
         val rowType = SparkTypeUtils.toPaimonType(withInitBucketCol.schema).asInstanceOf[RowType]
-        val assignerParallelism = Option(table.coreOptions.dynamicBucketAssignerParallelism)
+        val assignerParallelism = Option(coreOptions.dynamicBucketAssignerParallelism)
           .map(_.toInt)
           .getOrElse(sparkParallelism)
         val bootstrapped = bootstrapAndRepartitionByKeyHash(
@@ -186,10 +175,17 @@ case class PaimonSparkWriter(table: FileStoreTable) {
         writeWithBucket(repartitioned)
 
       case HASH_DYNAMIC =>
-        val assignerParallelism = Option(table.coreOptions.dynamicBucketAssignerParallelism)
-          .map(_.toInt)
-          .getOrElse(sparkParallelism)
-        val numAssigners = Option(table.coreOptions.dynamicBucketInitialBuckets)
+        val assignerParallelism = {
+          val parallelism = Option(coreOptions.dynamicBucketAssignerParallelism)
+            .map(_.toInt)
+            .getOrElse(sparkParallelism)
+          if (coreOptions.dynamicBucketMaxBuckets() != -1) {
+            Math.min(coreOptions.dynamicBucketMaxBuckets().toInt, parallelism)
+          } else {
+            parallelism
+          }
+        }
+        val numAssigners = Option(coreOptions.dynamicBucketInitialBuckets)
           .map(initialBuckets => Math.min(initialBuckets.toInt, assignerParallelism))
           .getOrElse(assignerParallelism)
 
@@ -201,7 +197,7 @@ case class PaimonSparkWriter(table: FileStoreTable) {
             numAssigners)
         }
 
-        if (table.snapshotManager().latestSnapshot() == null) {
+        if (table.snapshotManager().latestSnapshotFromFileSystem() == null) {
           // bootstrap mode
           // Topology: input -> shuffle by special key & partition hash -> bucket-assigner
           writeWithBucketAssigner(
@@ -212,8 +208,8 @@ case class PaimonSparkWriter(table: FileStoreTable) {
                 new SimpleHashBucketAssigner(
                   numAssigners,
                   TaskContext.getPartitionId(),
-                  table.coreOptions.dynamicBucketTargetRowNum,
-                  table.coreOptions.dynamicBucketMaxBuckets
+                  coreOptions.dynamicBucketTargetRowNum,
+                  coreOptions.dynamicBucketMaxBuckets
                 )
               row => {
                 val sparkRow = new SparkRow(rowType, row)
@@ -236,32 +232,31 @@ case class PaimonSparkWriter(table: FileStoreTable) {
           )
         }
 
-      case BUCKET_UNAWARE =>
-        // Topology: input ->
+      case BUCKET_UNAWARE | POSTPONE_MODE =>
         writeWithoutBucket(data)
 
       case HASH_FIXED =>
-        if (table.bucketSpec().getNumBuckets == -2) {
-          writeWithoutBucket(data)
-        } else if (!paimonExtensionEnabled) {
-          // Topology: input -> bucket-assigner -> shuffle by partition & bucket
-          writeWithBucketProcessor(
-            withInitBucketCol,
-            CommonBucketProcessor(table, bucketColIdx, encoderGroupWithBucketCol))
-        } else {
+        if (paimonExtensionEnabled && BucketFunction.supportsTable(table)) {
           // Topology: input -> shuffle by partition & bucket
-          val bucketNumber = table.coreOptions().bucket()
+          val bucketNumber = coreOptions.bucket()
           val bucketKeyCol = tableSchema
             .bucketKeys()
             .asScala
             .map(tableSchema.fieldNames().indexOf(_))
             .map(x => col(data.schema.fieldNames(x)))
             .toSeq
-          val args = Seq(lit(bucketNumber)) ++ bucketKeyCol
+          val args = Seq(
+            lit(new CoreOptions(tableSchema.options()).bucketFunctionType().toString),
+            lit(bucketNumber)) ++ bucketKeyCol
           val repartitioned =
             repartitionByPartitionsAndBucket(
               data.withColumn(BUCKET_COL, call_udf(BucketExpression.FIXED_BUCKET, args: _*)))
           writeWithBucket(repartitioned)
+        } else {
+          // Topology: input -> bucket-assigner -> shuffle by partition & bucket
+          writeWithBucketProcessor(
+            withInitBucketCol,
+            CommonBucketProcessor(table, bucketColIdx, encoderGroupWithBucketCol))
         }
 
       case _ =>
@@ -282,7 +277,7 @@ case class PaimonSparkWriter(table: FileStoreTable) {
   def persistDeletionVectors(deletionVectors: Dataset[SparkDeletionVector]): Seq[CommitMessage] = {
     val sparkSession = deletionVectors.sparkSession
     import sparkSession.implicits._
-    val snapshot = table.snapshotManager().latestSnapshot()
+    val snapshot = table.snapshotManager().latestSnapshotFromFileSystem()
     val serializedCommits = deletionVectors
       .groupByKey(_.partitionAndBucket)
       .mapGroups {
@@ -331,41 +326,6 @@ case class PaimonSparkWriter(table: FileStoreTable) {
       .map(deserializeCommitMessage(serializer, _))
   }
 
-  private def reportToHms(messages: Seq[CommitMessage]): Unit = {
-    if (disableReportStats) {
-      return
-    }
-
-    val options = table.coreOptions()
-    val partitionComputer = new InternalRowPartitionComputer(
-      options.partitionDefaultName,
-      table.schema.logicalPartitionType,
-      table.partitionKeys.toArray(new Array[String](0)),
-      options.legacyPartitionName()
-    )
-    val hmsReporter = new PartitionStatisticsReporter(
-      table,
-      table.catalogEnvironment.partitionHandler()
-    )
-
-    val partitions = messages.map(_.partition()).distinct
-    val currentTime = System.currentTimeMillis()
-    try {
-      partitions.foreach {
-        partition =>
-          val partitionPath = PartitionPathUtils.generatePartitionPath(
-            partitionComputer.generatePartValues(partition))
-          hmsReporter.report(partitionPath, currentTime)
-      }
-    } catch {
-      case e: Throwable =>
-        log.warn("Failed to report to hms", e)
-
-    } finally {
-      hmsReporter.close()
-    }
-  }
-
   def commit(commitMessages: Seq[CommitMessage]): Unit = {
     val tableCommit = writeBuilder.newCommit()
     try {
@@ -375,8 +335,7 @@ case class PaimonSparkWriter(table: FileStoreTable) {
     } finally {
       tableCommit.close()
     }
-
-    reportToHms(commitMessages)
+    postCommit(commitMessages)
   }
 
   /** Boostrap and repartition for cross partition mode. */
@@ -407,14 +366,14 @@ case class PaimonSparkWriter(table: FileStoreTable) {
                 row => {
                   val bytes: Array[Byte] =
                     SerializationUtils.serializeBinaryRow(bootstrapSer.toBinaryRow(row))
-                  (Math.abs(keyPartProject(row).hashCode()), (KeyPartOrRow.KEY_PART, bytes))
+                  (keyPartProject(row).hashCode(), (KeyPartOrRow.KEY_PART, bytes))
                 }) ++ iter.map(
               r => {
                 val sparkRow =
                   new SparkRow(rowType, r, SparkRowUtils.getRowKind(r, rowKindColIdx))
                 val bytes: Array[Byte] =
                   SerializationUtils.serializeBinaryRow(rowSer.toBinaryRow(sparkRow))
-                (Math.abs(rowProject(sparkRow).hashCode()), (KeyPartOrRow.ROW, bytes))
+                (rowProject(sparkRow).hashCode(), (KeyPartOrRow.ROW, bytes))
               })
           }
       }
@@ -474,6 +433,6 @@ case class PaimonSparkWriter(table: FileStoreTable) {
 
   private case class ModPartitioner(partitions: Int) extends Partitioner {
     override def numPartitions: Int = partitions
-    override def getPartition(key: Any): Int = key.asInstanceOf[Int] % numPartitions
+    override def getPartition(key: Any): Int = Math.abs(key.asInstanceOf[Int] % numPartitions)
   }
 }

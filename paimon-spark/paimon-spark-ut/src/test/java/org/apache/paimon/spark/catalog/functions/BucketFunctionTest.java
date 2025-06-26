@@ -56,6 +56,7 @@ import org.apache.paimon.shade.guava30.com.google.common.collect.ImmutableMap;
 
 import org.apache.spark.sql.SparkSession;
 import org.assertj.core.api.Assertions;
+import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.AfterEach;
 import org.junit.jupiter.api.BeforeAll;
 import org.junit.jupiter.api.Test;
@@ -66,6 +67,7 @@ import java.math.BigInteger;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
+import java.util.Objects;
 import java.util.Random;
 import java.util.UUID;
 import java.util.concurrent.ThreadLocalRandom;
@@ -96,6 +98,8 @@ public class BucketFunctionTest {
     private static final int COMPACTED_DECIMAL_SCALE = 9;
     private static final int TIMESTAMP_PRECISION = 6;
 
+    private static final String TIMESTAMP_COL_PRECISION_3 = "timestamp_col_precision_3";
+
     private static final RowType ROW_TYPE =
             new RowType(
                     Arrays.asList(
@@ -124,12 +128,13 @@ public class BucketFunctionTest {
                                     new LocalZonedTimestampType(TIMESTAMP_PRECISION)),
                             new DataField(
                                     12, BINARY_COL, new VarBinaryType(VarBinaryType.MAX_LENGTH)),
-                            new DataField(13, ID_COL, new IntType())));
+                            new DataField(13, ID_COL, new IntType()),
+                            new DataField(14, TIMESTAMP_COL_PRECISION_3, new TimestampType(3))));
 
     private static final InternalRow NULL_PAIMON_ROW =
             GenericRow.of(
-                    null, null, null, null, null, null, null, null, null, null, null, null, null,
-                    0);
+                    null, null, null, null, null, null, null, null, null, null, null, null, null, 0,
+                    null);
 
     private static InternalRow randomPaimonInternalRow() {
         Random random = new Random();
@@ -152,7 +157,8 @@ public class BucketFunctionTest {
                 Timestamp.fromMicros(System.nanoTime() / 1000),
                 Timestamp.fromMicros(System.nanoTime() / 1000),
                 UUID.randomUUID().toString().getBytes(),
-                1);
+                1,
+                Timestamp.fromEpochMillis(System.currentTimeMillis()));
     }
 
     private static final String TABLE_NAME = "test_bucket";
@@ -185,6 +191,11 @@ public class BucketFunctionTest {
         spark.sql(String.format("DROP TABLE IF EXISTS %s", TABLE_NAME));
     }
 
+    @AfterAll
+    public static void tearDown() {
+        spark.stop();
+    }
+
     public static void setupTable(String... bucketColumns) {
         String commitUser = UUID.randomUUID().toString();
         try {
@@ -199,7 +210,9 @@ public class BucketFunctionTest {
                                             CoreOptions.BUCKET_KEY.key(),
                                             String.join(",", bucketColumns),
                                             CoreOptions.BUCKET.key(),
-                                            String.valueOf(NUM_BUCKETS)),
+                                            String.valueOf(NUM_BUCKETS),
+                                            "file.format",
+                                            "avro"),
                                     ""));
             FileStoreTable storeTable =
                     FileStoreTableFactory.create(LocalFileIO.create(), tablePath, tableSchema);
@@ -218,11 +231,6 @@ public class BucketFunctionTest {
         } catch (Exception e) {
             throw new RuntimeException(e);
         }
-    }
-
-    @Test
-    public void test() {
-        validateSparkBucketFunction(INTEGER_COL);
     }
 
     private static void validateSparkBucketFunction(String... bucketColumns) {
@@ -307,10 +315,24 @@ public class BucketFunctionTest {
         while (bucketColumns == null || bucketColumns.length < 2) {
             bucketColumns =
                     allColumns.stream()
+                            .filter(e -> !Objects.equals(TIMESTAMP_COL_PRECISION_3, e))
                             .filter(e -> ThreadLocalRandom.current().nextBoolean())
                             .toArray(String[]::new);
         }
 
         validateSparkBucketFunction(bucketColumns);
+    }
+
+    @Test
+    public void testTimestampPrecisionNotEqualToSpark() {
+        setupTable(TIMESTAMP_COL_PRECISION_3);
+        spark.sql(
+                        String.format(
+                                "SELECT id_col, __paimon_bucket as expected_bucket, paimon.bucket(%s, %s) FROM %s",
+                                NUM_BUCKETS,
+                                String.join(",", TIMESTAMP_COL_PRECISION_3),
+                                TABLE_NAME))
+                .collectAsList()
+                .forEach(row -> Assertions.assertThat(row.getInt(2)).isNotEqualTo(row.get(1)));
     }
 }

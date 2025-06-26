@@ -23,25 +23,37 @@ import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogContext;
 import org.apache.paimon.catalog.CatalogFactory;
 import org.apache.paimon.catalog.PropertyChange;
+import org.apache.paimon.function.Function;
+import org.apache.paimon.function.FunctionDefinition;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.schema.Schema;
 import org.apache.paimon.schema.SchemaChange;
+import org.apache.paimon.spark.catalog.FormatTableCatalog;
 import org.apache.paimon.spark.catalog.SparkBaseCatalog;
-import org.apache.paimon.spark.catalog.SupportFunction;
 import org.apache.paimon.spark.catalog.SupportView;
+import org.apache.paimon.spark.catalog.functions.PaimonFunctions;
+import org.apache.paimon.spark.utils.CatalogUtils;
 import org.apache.paimon.table.FormatTable;
 import org.apache.paimon.table.FormatTableOptions;
+import org.apache.paimon.types.DataField;
+import org.apache.paimon.types.DataType;
 import org.apache.paimon.utils.TypeUtils;
 
+import org.apache.spark.sql.PaimonSparkSession$;
 import org.apache.spark.sql.SparkSession;
 import org.apache.spark.sql.catalyst.analysis.NamespaceAlreadyExistsException;
+import org.apache.spark.sql.catalyst.analysis.NoSuchFunctionException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchNamespaceException;
 import org.apache.spark.sql.catalyst.analysis.NoSuchTableException;
 import org.apache.spark.sql.catalyst.analysis.TableAlreadyExistsException;
+import org.apache.spark.sql.connector.catalog.FunctionCatalog;
 import org.apache.spark.sql.connector.catalog.Identifier;
 import org.apache.spark.sql.connector.catalog.NamespaceChange;
+import org.apache.spark.sql.connector.catalog.SupportsNamespaces;
 import org.apache.spark.sql.connector.catalog.TableCatalog;
+import org.apache.spark.sql.connector.catalog.TableCatalogCapability;
 import org.apache.spark.sql.connector.catalog.TableChange;
+import org.apache.spark.sql.connector.catalog.functions.UnboundFunction;
 import org.apache.spark.sql.connector.expressions.FieldReference;
 import org.apache.spark.sql.connector.expressions.IdentityTransform;
 import org.apache.spark.sql.connector.expressions.NamedReference;
@@ -67,29 +79,41 @@ import java.util.Collections;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.stream.Collectors;
 
 import static org.apache.paimon.CoreOptions.FILE_FORMAT;
 import static org.apache.paimon.CoreOptions.TYPE;
 import static org.apache.paimon.TableType.FORMAT_TABLE;
 import static org.apache.paimon.spark.SparkCatalogOptions.DEFAULT_DATABASE;
+import static org.apache.paimon.spark.SparkTypeUtils.CURRENT_DEFAULT_COLUMN_METADATA_KEY;
 import static org.apache.paimon.spark.SparkTypeUtils.toPaimonType;
 import static org.apache.paimon.spark.util.OptionUtils.checkRequiredConfigurations;
 import static org.apache.paimon.spark.util.OptionUtils.copyWithSQLConf;
 import static org.apache.paimon.spark.utils.CatalogUtils.checkNamespace;
+import static org.apache.paimon.spark.utils.CatalogUtils.checkNoDefaultValue;
+import static org.apache.paimon.spark.utils.CatalogUtils.isUpdateColumnDefaultValue;
 import static org.apache.paimon.spark.utils.CatalogUtils.removeCatalogName;
 import static org.apache.paimon.spark.utils.CatalogUtils.toIdentifier;
+import static org.apache.paimon.spark.utils.CatalogUtils.toUpdateColumnDefaultValue;
+import static org.apache.spark.sql.connector.catalog.TableCatalogCapability.SUPPORT_COLUMN_DEFAULT_VALUE;
 
 /** Spark {@link TableCatalog} for paimon. */
-public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, SupportView {
+public class SparkCatalog extends SparkBaseCatalog
+        implements SupportView, FunctionCatalog, SupportsNamespaces, FormatTableCatalog {
 
     private static final Logger LOG = LoggerFactory.getLogger(SparkCatalog.class);
 
+    public static final String FUNCTION_DEFINITION_NAME = "spark";
     private static final String PRIMARY_KEY_IDENTIFIER = "primary-key";
 
     protected Catalog catalog = null;
 
     private String defaultDatabase;
+
+    public Set<TableCatalogCapability> capabilities() {
+        return Collections.singleton(SUPPORT_COLUMN_DEFAULT_VALUE);
+    }
 
     @Override
     public void initialize(String name, CaseInsensitiveStringMap options) {
@@ -99,7 +123,7 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
         CatalogContext catalogContext =
                 CatalogContext.create(
                         Options.fromMap(options),
-                        SparkSession.active().sessionState().newHadoopConf());
+                        PaimonSparkSession$.MODULE$.active().sessionState().newHadoopConf());
         this.catalog = CatalogFactory.createCatalog(catalogContext);
         this.defaultDatabase =
                 options.getOrDefault(DEFAULT_DATABASE.key(), DEFAULT_DATABASE.defaultValue());
@@ -341,6 +365,7 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
         } else if (change instanceof TableChange.AddColumn) {
             TableChange.AddColumn add = (TableChange.AddColumn) change;
             SchemaChange.Move move = getMove(add.position(), add.fieldNames());
+            checkNoDefaultValue(add);
             return SchemaChange.addColumn(
                     add.fieldNames(),
                     toPaimonType(add.dataType()).copy(add.isNullable()),
@@ -367,6 +392,8 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
             TableChange.UpdateColumnPosition update = (TableChange.UpdateColumnPosition) change;
             SchemaChange.Move move = getMove(update.position(), update.fieldNames());
             return SchemaChange.updateColumnPosition(move);
+        } else if (isUpdateColumnDefaultValue(change)) {
+            return toUpdateColumnDefaultValue(change);
         } else {
             throw new UnsupportedOperationException(
                     "Change is not supported: " + change.getClass());
@@ -390,7 +417,7 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
             StructType schema, Transform[] partitions, Map<String, String> properties) {
         Map<String, String> normalizedProperties = new HashMap<>(properties);
         String provider = properties.get(TableCatalog.PROP_PROVIDER);
-        if (!usePaimon(provider) && SparkSource.FORMAT_NAMES().contains(provider.toLowerCase())) {
+        if (!usePaimon(provider) && isFormatTable(provider)) {
             normalizedProperties.put(TYPE.key(), FORMAT_TABLE.toString());
             normalizedProperties.put(FILE_FORMAT.key(), provider.toLowerCase());
         }
@@ -416,10 +443,16 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
                         .comment(properties.getOrDefault(TableCatalog.PROP_COMMENT, null));
 
         for (StructField field : schema.fields()) {
-            schemaBuilder.column(
-                    field.name(),
-                    toPaimonType(field.dataType()).copy(field.nullable()),
-                    field.getComment().getOrElse(() -> null));
+            String name = field.name();
+            DataType type = toPaimonType(field.dataType()).copy(field.nullable());
+            String comment = field.getComment().getOrElse(() -> null);
+            if (field.metadata().contains(CURRENT_DEFAULT_COLUMN_METADATA_KEY)) {
+                String defaultValue =
+                        field.metadata().getString(CURRENT_DEFAULT_COLUMN_METADATA_KEY);
+                schemaBuilder.column(name, type, comment, defaultValue);
+            } else {
+                schemaBuilder.column(name, type, comment);
+            }
         }
         return schemaBuilder.build();
     }
@@ -464,6 +497,7 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
     }
 
     private static FileTable convertToFileTable(Identifier ident, FormatTable formatTable) {
+        SparkSession spark = PaimonSparkSession$.MODULE$.active();
         StructType schema = SparkTypeUtils.fromPaimonRowType(formatTable.rowType());
         StructType partitionSchema =
                 SparkTypeUtils.fromPaimonRowType(
@@ -477,7 +511,7 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
             dsOptions = new CaseInsensitiveStringMap(options.toMap());
             return new PartitionedCSVTable(
                     ident.name(),
-                    SparkSession.active(),
+                    spark,
                     dsOptions,
                     scala.collection.JavaConverters.asScalaBuffer(pathList).toSeq(),
                     scala.Option.apply(schema),
@@ -486,7 +520,7 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
         } else if (formatTable.format() == FormatTable.Format.ORC) {
             return new PartitionedOrcTable(
                     ident.name(),
-                    SparkSession.active(),
+                    spark,
                     dsOptions,
                     scala.collection.JavaConverters.asScalaBuffer(pathList).toSeq(),
                     scala.Option.apply(schema),
@@ -495,7 +529,7 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
         } else if (formatTable.format() == FormatTable.Format.PARQUET) {
             return new PartitionedParquetTable(
                     ident.name(),
-                    SparkSession.active(),
+                    spark,
                     dsOptions,
                     scala.collection.JavaConverters.asScalaBuffer(pathList).toSeq(),
                     scala.Option.apply(schema),
@@ -504,7 +538,7 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
         } else if (formatTable.format() == FormatTable.Format.JSON) {
             return new PartitionedJsonTable(
                     ident.name(),
-                    SparkSession.active(),
+                    spark,
                     dsOptions,
                     scala.collection.JavaConverters.asScalaBuffer(pathList).toSeq(),
                     scala.Option.apply(schema),
@@ -548,6 +582,75 @@ public class SparkCatalog extends SparkBaseCatalog implements SupportFunction, S
         } catch (Catalog.DatabaseNotExistException e) {
             throw new NoSuchNamespaceException(namespace);
         }
+    }
+
+    @Override
+    public Identifier[] listFunctions(String[] namespace) throws NoSuchNamespaceException {
+        if (isFunctionNamespace(namespace)) {
+            List<Identifier> functionIdentifiers = new ArrayList<>();
+            PaimonFunctions.names()
+                    .forEach(name -> functionIdentifiers.add(Identifier.of(namespace, name)));
+            if (namespace.length > 0) {
+                String databaseName = getDatabaseNameFromNamespace(namespace);
+                try {
+                    catalog.listFunctions(databaseName)
+                            .forEach(
+                                    name ->
+                                            functionIdentifiers.add(
+                                                    Identifier.of(namespace, name)));
+                } catch (Catalog.DatabaseNotExistException e) {
+                    throw new NoSuchNamespaceException(namespace);
+                }
+            }
+            return functionIdentifiers.toArray(new Identifier[0]);
+        }
+        throw new NoSuchNamespaceException(namespace);
+    }
+
+    @Override
+    public UnboundFunction loadFunction(Identifier ident) throws NoSuchFunctionException {
+        if (isFunctionNamespace(ident.namespace())) {
+            UnboundFunction func = PaimonFunctions.load(ident.name());
+            if (func != null) {
+                return func;
+            }
+            try {
+                Function paimonFunction = catalog.getFunction(toIdentifier(ident));
+                FunctionDefinition functionDefinition =
+                        paimonFunction.definition(FUNCTION_DEFINITION_NAME);
+                if (functionDefinition != null
+                        && functionDefinition
+                                instanceof FunctionDefinition.LambdaFunctionDefinition) {
+                    FunctionDefinition.LambdaFunctionDefinition lambdaFunctionDefinition =
+                            (FunctionDefinition.LambdaFunctionDefinition) functionDefinition;
+                    if (paimonFunction.returnParams().isPresent()) {
+                        List<DataField> dataFields = paimonFunction.returnParams().get();
+                        if (dataFields.size() == 1) {
+                            DataField dataField = dataFields.get(0);
+                            return new LambdaScalarFunction(
+                                    ident.name(),
+                                    CatalogUtils.paimonType2SparkType(dataField.type()),
+                                    CatalogUtils.paimonType2JavaType(dataField.type()),
+                                    lambdaFunctionDefinition.definition());
+                        } else {
+                            throw new UnsupportedOperationException(
+                                    "outParams size > 1 is not supported");
+                        }
+                    }
+                }
+            } catch (Catalog.FunctionNotExistException e) {
+                throw new NoSuchFunctionException(ident);
+            }
+        }
+
+        throw new NoSuchFunctionException(ident);
+    }
+
+    private boolean isFunctionNamespace(String[] namespace) {
+        // Allow for empty namespace, as Spark's bucket join will use `bucket` function with empty
+        // namespace to generate transforms for partitioning.
+        // Otherwise, check if it is paimon namespace.
+        return namespace.length == 0 || (namespace.length == 1 && namespaceExists(namespace));
     }
 
     private PropertyChange toPropertyChange(NamespaceChange change) {

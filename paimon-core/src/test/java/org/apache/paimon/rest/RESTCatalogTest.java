@@ -20,6 +20,7 @@ package org.apache.paimon.rest;
 
 import org.apache.paimon.PagedList;
 import org.apache.paimon.Snapshot;
+import org.apache.paimon.TableType;
 import org.apache.paimon.catalog.Catalog;
 import org.apache.paimon.catalog.CatalogTestBase;
 import org.apache.paimon.catalog.Identifier;
@@ -27,6 +28,9 @@ import org.apache.paimon.catalog.PropertyChange;
 import org.apache.paimon.data.BinaryString;
 import org.apache.paimon.data.GenericRow;
 import org.apache.paimon.data.InternalRow;
+import org.apache.paimon.function.Function;
+import org.apache.paimon.function.FunctionChange;
+import org.apache.paimon.function.FunctionDefinition;
 import org.apache.paimon.options.Options;
 import org.apache.paimon.partition.Partition;
 import org.apache.paimon.partition.PartitionStatistics;
@@ -50,6 +54,7 @@ import org.apache.paimon.table.source.Split;
 import org.apache.paimon.table.source.TableRead;
 import org.apache.paimon.types.DataField;
 import org.apache.paimon.types.DataTypes;
+import org.apache.paimon.utils.SnapshotManager;
 import org.apache.paimon.view.View;
 import org.apache.paimon.view.ViewChange;
 
@@ -59,6 +64,7 @@ import org.apache.paimon.shade.guava30.com.google.common.collect.Lists;
 import org.apache.paimon.shade.guava30.com.google.common.collect.Maps;
 
 import org.apache.commons.io.FileUtils;
+import org.apache.commons.lang3.StringUtils;
 import org.junit.jupiter.api.Assertions;
 import org.junit.jupiter.api.Test;
 
@@ -70,21 +76,27 @@ import java.time.ZonedDateTime;
 import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.Collections;
-import java.util.Comparator;
+import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
 import java.util.UUID;
 import java.util.concurrent.atomic.AtomicInteger;
+import java.util.stream.Collectors;
 
+import static java.util.Collections.emptyMap;
+import static java.util.Collections.singletonList;
+import static java.util.Collections.singletonMap;
 import static org.apache.paimon.CoreOptions.METASTORE_PARTITIONED_TABLE;
 import static org.apache.paimon.CoreOptions.METASTORE_TAG_TO_PARTITION;
+import static org.apache.paimon.CoreOptions.QUERY_AUTH_ENABLED;
 import static org.apache.paimon.catalog.Catalog.SYSTEM_DATABASE_NAME;
-import static org.apache.paimon.rest.RESTCatalog.PAGE_TOKEN;
-import static org.apache.paimon.rest.auth.DLFAuthProvider.TOKEN_DATE_FORMATTER;
+import static org.apache.paimon.rest.RESTApi.PAGE_TOKEN;
+import static org.apache.paimon.rest.auth.DLFToken.TOKEN_DATE_FORMATTER;
 import static org.apache.paimon.utils.SnapshotManagerTest.createSnapshotWithMillis;
 import static org.assertj.core.api.Assertions.assertThat;
 import static org.assertj.core.api.Assertions.assertThatExceptionOfType;
+import static org.assertj.core.api.Assertions.assertThatThrownBy;
 import static org.junit.jupiter.api.Assertions.assertDoesNotThrow;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
@@ -116,18 +128,18 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
     @Test
     void testListDatabasesPaged() throws Catalog.DatabaseAlreadyExistException {
         // List databases paged returns an empty list when there are no databases in the catalog
-        PagedList<String> pagedDatabases = catalog.listDatabasesPaged(null, null);
+        PagedList<String> pagedDatabases = catalog.listDatabasesPaged(null, null, null);
         assertThat(pagedDatabases.getElements()).isEmpty();
         assertNull(pagedDatabases.getNextPageToken());
 
-        String[] dbNames = {"ghj", "db1", "db2", "db3", "ert"};
+        String[] dbNames = {"ghj", "db1", "db2", "db3", "ert", "db_name"};
         for (String dbName : dbNames) {
             catalog.createDatabase(dbName, true);
         }
 
         // when maxResults is null or 0, the page length is set to a server configured value
         String[] sortedDbNames = Arrays.stream(dbNames).sorted().toArray(String[]::new);
-        pagedDatabases = catalog.listDatabasesPaged(null, null);
+        pagedDatabases = catalog.listDatabasesPaged(null, null, null);
         List<String> dbs = pagedDatabases.getElements();
         assertThat(dbs).containsExactly(sortedDbNames);
         assertNull(pagedDatabases.getNextPageToken());
@@ -136,36 +148,64 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         // server configured value
         // when pageToken is null, will list tables from the beginning
         int maxResults = 2;
-        pagedDatabases = catalog.listDatabasesPaged(maxResults, null);
+        pagedDatabases = catalog.listDatabasesPaged(maxResults, null, null);
         dbs = pagedDatabases.getElements();
         assertEquals(maxResults, dbs.size());
         assertThat(dbs).containsExactly("db1", "db2");
         assertEquals("db2", pagedDatabases.getNextPageToken());
 
         // when pageToken is not null, will list tables from the pageToken (exclusive)
-        pagedDatabases = catalog.listDatabasesPaged(maxResults, pagedDatabases.getNextPageToken());
+        pagedDatabases =
+                catalog.listDatabasesPaged(maxResults, pagedDatabases.getNextPageToken(), null);
         dbs = pagedDatabases.getElements();
         assertEquals(maxResults, dbs.size());
-        assertThat(dbs).containsExactly("db3", "ert");
-        assertEquals("ert", pagedDatabases.getNextPageToken());
+        assertThat(dbs).containsExactly("db3", "db_name");
 
-        pagedDatabases = catalog.listDatabasesPaged(maxResults, pagedDatabases.getNextPageToken());
+        pagedDatabases =
+                catalog.listDatabasesPaged(maxResults, pagedDatabases.getNextPageToken(), null);
         dbs = pagedDatabases.getElements();
-        assertEquals(1, dbs.size());
-        assertThat(dbs).containsExactly("ghj");
+        assertEquals(2, dbs.size());
+        assertThat(dbs).containsExactly("ert", "ghj");
+
+        pagedDatabases =
+                catalog.listDatabasesPaged(maxResults, pagedDatabases.getNextPageToken(), null);
+        dbs = pagedDatabases.getElements();
+        assertTrue(dbs.isEmpty());
         assertNull(pagedDatabases.getNextPageToken());
 
         maxResults = 8;
-        pagedDatabases = catalog.listDatabasesPaged(maxResults, null);
+        pagedDatabases = catalog.listDatabasesPaged(maxResults, null, null);
         dbs = pagedDatabases.getElements();
         String[] expectedTableNames = Arrays.stream(dbNames).sorted().toArray(String[]::new);
         assertThat(dbs).containsExactly(expectedTableNames);
         assertNull(pagedDatabases.getNextPageToken());
 
-        pagedDatabases = catalog.listDatabasesPaged(maxResults, "ddd");
+        pagedDatabases = catalog.listDatabasesPaged(maxResults, "ddd", null);
         dbs = pagedDatabases.getElements();
         assertEquals(2, dbs.size());
         assertThat(dbs).containsExactly("ert", "ghj");
+        assertNull(pagedDatabases.getNextPageToken());
+
+        pagedDatabases = catalog.listDatabasesPaged(maxResults, null, "db%");
+        dbs = pagedDatabases.getElements();
+        assertEquals(4, dbs.size());
+        assertThat(dbs).containsExactly("db1", "db2", "db3", "db_name");
+        assertNull(pagedDatabases.getNextPageToken());
+
+        pagedDatabases = catalog.listDatabasesPaged(maxResults, null, "db");
+        dbs = pagedDatabases.getElements();
+        assertTrue(dbs.isEmpty());
+        assertNull(pagedDatabases.getNextPageToken());
+
+        pagedDatabases = catalog.listDatabasesPaged(maxResults, null, "db_");
+        dbs = pagedDatabases.getElements();
+        assertTrue(dbs.isEmpty());
+        assertNull(pagedDatabases.getNextPageToken());
+
+        pagedDatabases = catalog.listDatabasesPaged(maxResults, null, "db_%");
+        dbs = pagedDatabases.getElements();
+        assertEquals(1, dbs.size());
+        assertThat(dbs).containsExactly("db_name");
         assertNull(pagedDatabases.getNextPageToken());
     }
 
@@ -269,6 +309,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
                 () ->
                         restCatalog.commitSnapshot(
                                 identifier,
+                                "",
                                 createSnapshotWithMillis(1L, System.currentTimeMillis()),
                                 new ArrayList<PartitionStatistics>()));
     }
@@ -319,7 +360,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         assertThat(pagedTables.getElements()).isEmpty();
         assertNull(pagedTables.getNextPageToken());
 
-        String[] tableNames = {"table1", "table2", "table3", "abd", "def", "opr"};
+        String[] tableNames = {"table1", "table2", "table3", "abd", "def", "opr", "table_name"};
         for (String tableName : tableNames) {
             catalog.createTable(
                     Identifier.create(databaseName, tableName), DEFAULT_TABLE_SCHEMA, false);
@@ -363,7 +404,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
                 catalog.listTablesPaged(
                         databaseName, maxResults, pagedTables.getNextPageToken(), null);
         tables = pagedTables.getElements();
-        assertEquals(0, tables.size());
+        assertEquals(1, tables.size());
         assertNull(pagedTables.getNextPageToken());
 
         maxResults = 8;
@@ -374,8 +415,8 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
         pagedTables = catalog.listTablesPaged(databaseName, maxResults, "table1", null);
         tables = pagedTables.getElements();
-        assertEquals(2, tables.size());
-        assertThat(tables).containsExactly("table2", "table3");
+        assertEquals(3, tables.size());
+        assertThat(tables).containsExactly("table2", "table3", "table_name");
         assertNull(pagedTables.getNextPageToken());
 
         // List tables throws DatabaseNotExistException when the database does not exist
@@ -384,43 +425,34 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
         pagedTables = catalog.listTablesPaged(databaseName, null, null, "table%");
         tables = pagedTables.getElements();
-        assertEquals(3, tables.size());
-        assertThat(tables).containsExactly("table1", "table2", "table3");
+        assertEquals(4, tables.size());
+        assertThat(tables).containsExactly("table1", "table2", "table3", "table_name");
         assertNull(pagedTables.getNextPageToken());
 
         pagedTables = catalog.listTablesPaged(databaseName, null, null, "table_");
         tables = pagedTables.getElements();
-        assertEquals(3, tables.size());
-        assertThat(tables).containsExactly("table1", "table2", "table3");
+        assertTrue(tables.isEmpty());
         assertNull(pagedTables.getNextPageToken());
 
         pagedTables = catalog.listTablesPaged(databaseName, null, null, "table_%");
         tables = pagedTables.getElements();
-        assertEquals(3, tables.size());
-        assertThat(tables).containsExactly("table1", "table2", "table3");
+        assertEquals(1, tables.size());
+        assertThat(tables).containsExactly("table_name");
         assertNull(pagedTables.getNextPageToken());
 
-        pagedTables = catalog.listTablesPaged(databaseName, null, null, "table%_");
+        pagedTables = catalog.listTablesPaged(databaseName, null, null, "table_name");
         tables = pagedTables.getElements();
-        assertEquals(3, tables.size());
-        assertThat(tables).containsExactly("table1", "table2", "table3");
+        assertEquals(1, tables.size());
+        assertThat(tables).containsExactly("table_name");
         assertNull(pagedTables.getNextPageToken());
 
-        pagedTables = catalog.listTablesPaged(databaseName, null, null, "table\\_");
-        Assertions.assertTrue(pagedTables.getElements().isEmpty());
-        Assertions.assertNull(pagedTables.getNextPageToken());
-
-        pagedTables = catalog.listTablesPaged(databaseName, null, null, "tabl_");
-        Assertions.assertTrue(pagedTables.getElements().isEmpty());
-        Assertions.assertNull(pagedTables.getNextPageToken());
+        Assertions.assertThrows(
+                BadRequestException.class,
+                () -> catalog.listTablesPaged(databaseName, null, null, "%table"));
 
         Assertions.assertThrows(
                 BadRequestException.class,
                 () -> catalog.listTablesPaged(databaseName, null, null, "ta%le"));
-
-        Assertions.assertThrows(
-                BadRequestException.class,
-                () -> catalog.listTablesPaged(databaseName, null, null, "ta_le"));
     }
 
     @Test
@@ -433,7 +465,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         assertThat(pagedTableDetails.getElements()).isEmpty();
         assertNull(pagedTableDetails.getNextPageToken());
 
-        String[] tableNames = {"table1", "table2", "table3", "abd", "def", "opr"};
+        String[] tableNames = {"table1", "table2", "table3", "abd", "def", "opr", "table_name"};
         String[] expectedTableNames = Arrays.stream(tableNames).sorted().toArray(String[]::new);
         for (String tableName : tableNames) {
             catalog.createTable(
@@ -464,7 +496,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         pagedTableDetails =
                 catalog.listTableDetailsPaged(
                         databaseName, maxResults, pagedTableDetails.getNextPageToken(), null);
-        assertEquals(0, pagedTableDetails.getElements().size());
+        assertEquals(1, pagedTableDetails.getElements().size());
         assertNull(pagedTableDetails.getNextPageToken());
 
         maxResults = 8;
@@ -476,7 +508,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         String pageToken = "table1";
         pagedTableDetails =
                 catalog.listTableDetailsPaged(databaseName, maxResults, pageToken, null);
-        assertPagedTableDetails(pagedTableDetails, 2, "table2", "table3");
+        assertPagedTableDetails(pagedTableDetails, 3, "table2", "table3", "table_name");
         assertNull(pagedTableDetails.getNextPageToken());
 
         // List table details throws DatabaseNotExistException when the database does not exist
@@ -492,27 +524,15 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
                 .isThrownBy(() -> catalog.listTables("non_existing_db"));
 
         pagedTableDetails = catalog.listTableDetailsPaged(databaseName, null, null, "table%");
-        assertPagedTableDetails(pagedTableDetails, 3, "table1", "table2", "table3");
+        assertPagedTableDetails(pagedTableDetails, 4, "table1", "table2", "table3", "table_name");
         assertNull(pagedTableDetails.getNextPageToken());
 
         pagedTableDetails = catalog.listTableDetailsPaged(databaseName, null, null, "table_");
-        assertPagedTableDetails(pagedTableDetails, 3, "table1", "table2", "table3");
+        Assertions.assertTrue(pagedTableDetails.getElements().isEmpty());
         assertNull(pagedTableDetails.getNextPageToken());
 
         pagedTableDetails = catalog.listTableDetailsPaged(databaseName, null, null, "table_%");
-        assertPagedTableDetails(pagedTableDetails, 3, "table1", "table2", "table3");
-        assertNull(pagedTableDetails.getNextPageToken());
-
-        pagedTableDetails = catalog.listTableDetailsPaged(databaseName, null, null, "table%_");
-        assertPagedTableDetails(pagedTableDetails, 3, "table1", "table2", "table3");
-        assertNull(pagedTableDetails.getNextPageToken());
-
-        pagedTableDetails = catalog.listTableDetailsPaged(databaseName, null, null, "table\\_");
-        assertTrue(pagedTableDetails.getElements().isEmpty());
-        assertNull(pagedTableDetails.getNextPageToken());
-
-        pagedTableDetails = catalog.listTableDetailsPaged(databaseName, null, null, "tabl_");
-        assertTrue(pagedTableDetails.getElements().isEmpty());
+        assertPagedTableDetails(pagedTableDetails, 1, "table_name");
         assertNull(pagedTableDetails.getNextPageToken());
 
         Assertions.assertThrows(
@@ -521,7 +541,148 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
         Assertions.assertThrows(
                 BadRequestException.class,
-                () -> catalog.listTableDetailsPaged(databaseName, null, null, "ta_le"));
+                () -> catalog.listTableDetailsPaged(databaseName, null, null, "%tale"));
+    }
+
+    @Test
+    public void testListTablesPagedGlobally() throws Exception {
+        // List table paged globally returns an empty list when there are no tables in the catalog
+
+        PagedList<Identifier> pagedTables = catalog.listTablesPagedGlobally(null, null, null, null);
+        assertThat(pagedTables.getElements()).isEmpty();
+        assertNull(pagedTables.getNextPageToken());
+
+        String databaseName = "list_tables_paged_globally db";
+        String databaseName2 = "sample";
+        String databaseNamePattern = "list_tables_paged_globally%";
+        String[] tableNames = {
+            "table1", "table2", "table3", "abd", "def", "opr", "format_table", "table_name"
+        };
+        prepareDataForListTablesPagedGlobally(databaseName, databaseName2, tableNames);
+
+        Identifier[] expectedTableNames =
+                Arrays.stream(tableNames)
+                        .map(tableName -> Identifier.create(databaseName, tableName))
+                        .toArray(Identifier[]::new);
+        Identifier[] fullTableNames = Arrays.copyOf(expectedTableNames, tableNames.length + 1);
+        fullTableNames[tableNames.length] = Identifier.create(databaseName2, "table1");
+
+        pagedTables = catalog.listTablesPagedGlobally(databaseNamePattern, null, null, null);
+        assertThat(pagedTables.getElements()).containsExactlyInAnyOrder(expectedTableNames);
+        assertNull(pagedTables.getNextPageToken());
+
+        assertListTablesPagedGloballyWithLoop(databaseNamePattern, expectedTableNames);
+        assertListTablesPagedGloballyWithLoop(null, fullTableNames);
+
+        assertListTablesPagedGloballyWithTablePattern(
+                databaseName, databaseNamePattern, expectedTableNames);
+    }
+
+    protected void prepareDataForListTablesPagedGlobally(
+            String databaseName, String databaseName2, String[] tableNames)
+            throws Catalog.DatabaseAlreadyExistException, Catalog.TableAlreadyExistException,
+                    Catalog.DatabaseNotExistException {
+        catalog.createDatabase(databaseName, false);
+        catalog.createDatabase(databaseName2, false);
+
+        Map<String, String> options = new HashMap<>();
+        options.put("type", TableType.FORMAT_TABLE.toString());
+
+        Schema formatTableSchema =
+                new Schema(
+                        Lists.newArrayList(
+                                new DataField(0, "pk", DataTypes.INT()),
+                                new DataField(1, "col1", DataTypes.STRING()),
+                                new DataField(2, "col2", DataTypes.STRING())),
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        options,
+                        "");
+
+        for (String tableName : tableNames) {
+            if (StringUtils.equals(tableName, "format_table")) {
+                catalog.createTable(
+                        Identifier.create(databaseName, tableName), formatTableSchema, false);
+            } else {
+                catalog.createTable(
+                        Identifier.create(databaseName, tableName), DEFAULT_TABLE_SCHEMA, false);
+            }
+        }
+
+        catalog.createTable(
+                Identifier.create(databaseName2, "table1"), DEFAULT_TABLE_SCHEMA, false);
+    }
+
+    protected void assertListTablesPagedGloballyWithLoop(
+            String databaseNamePattern, Identifier[] expectedTableNames) {
+        int maxResults = 2;
+        PagedList<Identifier> pagedTables;
+        List<Identifier> tables = new ArrayList<>();
+        String pageToken = null;
+        do {
+            pagedTables =
+                    catalog.listTablesPagedGlobally(
+                            databaseNamePattern, null, maxResults, pageToken);
+            pageToken = pagedTables.getNextPageToken();
+            if (pagedTables.getElements() != null) {
+                tables.addAll(pagedTables.getElements());
+            }
+            if (pageToken == null
+                    || pagedTables.getElements() == null
+                    || pagedTables.getElements().isEmpty()) {
+                break;
+            }
+        } while (StringUtils.isNotEmpty(pageToken));
+        assertEquals(expectedTableNames.length, tables.size());
+        assertThat(tables).containsExactlyInAnyOrder(expectedTableNames);
+        assertNull(pagedTables.getNextPageToken());
+    }
+
+    protected void assertListTablesPagedGloballyWithTablePattern(
+            String databaseName, String databaseNamePattern, Identifier[] expectedTableNames) {
+        int maxResults = 9;
+        PagedList<Identifier> pagedTables =
+                catalog.listTablesPagedGlobally(databaseNamePattern, null, maxResults, null);
+        assertEquals(
+                Math.min(maxResults, expectedTableNames.length), pagedTables.getElements().size());
+        assertThat(pagedTables.getElements()).containsExactlyInAnyOrder(expectedTableNames);
+        assertNull(pagedTables.getNextPageToken());
+
+        pagedTables = catalog.listTablesPagedGlobally(databaseNamePattern, "table%", null, null);
+        assertEquals(4, pagedTables.getElements().size());
+        assertThat(pagedTables.getElements())
+                .containsExactlyInAnyOrder(
+                        Identifier.create(databaseName, "table1"),
+                        Identifier.create(databaseName, "table2"),
+                        Identifier.create(databaseName, "table3"),
+                        Identifier.create(databaseName, "table_name"));
+        assertNull(pagedTables.getNextPageToken());
+
+        pagedTables = catalog.listTablesPagedGlobally(databaseNamePattern, "table_", null, null);
+        assertTrue(pagedTables.getElements().isEmpty());
+        assertNull(pagedTables.getNextPageToken());
+
+        pagedTables = catalog.listTablesPagedGlobally(databaseNamePattern, "table_%", null, null);
+        assertEquals(1, pagedTables.getElements().size());
+        assertThat(pagedTables.getElements())
+                .containsExactlyInAnyOrder(Identifier.create(databaseName, "table_name"));
+        assertNull(pagedTables.getNextPageToken());
+
+        pagedTables = catalog.listTablesPagedGlobally(databaseNamePattern, "tabl_", null, null);
+        assertTrue(pagedTables.getElements().isEmpty());
+        assertNull(pagedTables.getNextPageToken());
+
+        Assertions.assertThrows(
+                BadRequestException.class,
+                () -> catalog.listTablesPagedGlobally(databaseNamePattern, "ta%le", null, null));
+
+        Assertions.assertThrows(
+                BadRequestException.class,
+                () -> catalog.listTablesPagedGlobally(databaseNamePattern, "%tale", null, null));
+    }
+
+    private String buildFullName(String database, String tableName) {
+        return String.format("%s.%s", database, tableName);
     }
 
     @Test
@@ -562,7 +723,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         // catalogs except RestCatalog
         // even if the maxResults or pageToken is not null
         View view = buildView(databaseName);
-        String[] viewNames = {"view1", "view2", "view3", "abd", "def", "opr"};
+        String[] viewNames = {"view1", "view2", "view3", "abd", "def", "opr", "view_name"};
         String[] sortedViewNames = Arrays.stream(viewNames).sorted().toArray(String[]::new);
         for (String viewName : viewNames) {
             catalog.createView(Identifier.create(databaseName, viewName), view, false);
@@ -597,7 +758,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
         String pageToken = "view1";
         pagedViews = catalog.listViewsPaged(databaseName, maxResults, pageToken, null);
-        assertPagedViews(pagedViews, "view2", "view3");
+        assertPagedViews(pagedViews, "view2", "view3", "view_name");
         assertNull(pagedViews.getNextPageToken());
 
         // List views throws DatabaseNotExistException when the database does not exist
@@ -609,27 +770,15 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
                                         "non_existing_db", finalMaxResults, pageToken, null));
 
         pagedViews = catalog.listViewsPaged(databaseName, null, null, "view%");
-        assertPagedViews(pagedViews, "view1", "view2", "view3");
-        assertNull(pagedViews.getNextPageToken());
-
-        pagedViews = catalog.listViewsPaged(databaseName, null, null, "view_");
-        assertPagedViews(pagedViews, "view1", "view2", "view3");
+        assertPagedViews(pagedViews, "view1", "view2", "view3", "view_name");
         assertNull(pagedViews.getNextPageToken());
 
         pagedViews = catalog.listViewsPaged(databaseName, null, null, "view_%");
-        assertPagedViews(pagedViews, "view1", "view2", "view3");
+        assertPagedViews(pagedViews, "view_name");
         assertNull(pagedViews.getNextPageToken());
 
-        pagedViews = catalog.listViewsPaged(databaseName, null, null, "view%_");
-        assertPagedViews(pagedViews, "view1", "view2", "view3");
-        assertNull(pagedViews.getNextPageToken());
-
-        pagedViews = catalog.listViewsPaged(databaseName, null, null, "view\\_");
+        pagedViews = catalog.listViewsPaged(databaseName, null, null, "view_");
         assertTrue(pagedViews.getElements().isEmpty());
-        assertNull(pagedViews.getNextPageToken());
-
-        pagedViews = catalog.listViewsPaged(databaseName, null, null, "vie_");
-        Assertions.assertTrue(pagedViews.getElements().isEmpty());
         assertNull(pagedViews.getNextPageToken());
 
         Assertions.assertThrows(
@@ -638,7 +787,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
         Assertions.assertThrows(
                 BadRequestException.class,
-                () -> catalog.listViewsPaged(databaseName, null, null, "vi_ew"));
+                () -> catalog.listViewsPaged(databaseName, null, null, "%view"));
     }
 
     @Test
@@ -651,7 +800,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         assertThat(pagedViewDetails.getElements()).isEmpty();
         assertNull(pagedViewDetails.getNextPageToken());
 
-        String[] viewNames = {"view1", "view2", "view3", "abd", "def", "opr"};
+        String[] viewNames = {"view1", "view2", "view3", "abd", "def", "opr", "view_name"};
         View view = buildView(databaseName);
         for (String viewName : viewNames) {
             catalog.createView(Identifier.create(databaseName, viewName), view, false);
@@ -681,7 +830,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         pagedViewDetails =
                 catalog.listViewDetailsPaged(
                         databaseName, maxResults, pagedViewDetails.getNextPageToken(), null);
-        assertEquals(0, pagedViewDetails.getElements().size());
+        assertEquals(1, pagedViewDetails.getElements().size());
         assertNull(pagedViewDetails.getNextPageToken());
 
         maxResults = 8;
@@ -696,7 +845,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
         String pageToken = "view1";
         pagedViewDetails = catalog.listViewDetailsPaged(databaseName, maxResults, pageToken, null);
-        assertPagedViewDetails(pagedViewDetails, view, 2, "view2", "view3");
+        assertPagedViewDetails(pagedViewDetails, view, 3, "view2", "view3", "view_name");
         assertNull(pagedViewDetails.getNextPageToken());
 
         // List view details throws DatabaseNotExistException when the database does not exist
@@ -708,27 +857,15 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
                                         "non_existing_db", finalMaxResults, pageToken, null));
 
         pagedViewDetails = catalog.listViewDetailsPaged(databaseName, null, null, "view%");
-        assertPagedViewDetails(pagedViewDetails, view, 3, "view1", "view2", "view3");
+        assertPagedViewDetails(pagedViewDetails, view, 4, "view1", "view2", "view3", "view_name");
         assertNull(pagedViewDetails.getNextPageToken());
 
         pagedViewDetails = catalog.listViewDetailsPaged(databaseName, null, null, "view_");
-        assertPagedViewDetails(pagedViewDetails, view, 3, "view1", "view2", "view3");
-        assertNull(pagedViewDetails.getNextPageToken());
-
-        pagedViewDetails = catalog.listViewDetailsPaged(databaseName, null, null, "view%_");
-        assertPagedViewDetails(pagedViewDetails, view, 3, "view1", "view2", "view3");
+        Assertions.assertTrue(pagedViewDetails.getElements().isEmpty());
         assertNull(pagedViewDetails.getNextPageToken());
 
         pagedViewDetails = catalog.listViewDetailsPaged(databaseName, null, null, "view_%");
-        assertPagedViewDetails(pagedViewDetails, view, 3, "view1", "view2", "view3");
-        assertNull(pagedViewDetails.getNextPageToken());
-
-        pagedViewDetails = catalog.listViewDetailsPaged(databaseName, null, null, "vie_");
-        Assertions.assertTrue(pagedViewDetails.getElements().isEmpty());
-        assertNull(pagedViewDetails.getNextPageToken());
-
-        pagedViewDetails = catalog.listViewDetailsPaged(databaseName, null, null, "view\\_");
-        Assertions.assertTrue(pagedViewDetails.getElements().isEmpty());
+        assertPagedViewDetails(pagedViewDetails, view, 1, "view_name");
         assertNull(pagedViewDetails.getNextPageToken());
 
         Assertions.assertThrows(
@@ -737,7 +874,119 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
         Assertions.assertThrows(
                 BadRequestException.class,
-                () -> catalog.listViewDetailsPaged(databaseName, null, null, "vi_ew"));
+                () -> catalog.listViewDetailsPaged(databaseName, null, null, "%view"));
+    }
+
+    @Test
+    public void testListViewsPagedGlobally() throws Exception {
+        // list views paged globally returns an empty list when there are no views in the catalog
+
+        PagedList<Identifier> pagedViews = catalog.listViewsPagedGlobally(null, null, null, null);
+        assertThat(pagedViews.getElements()).isEmpty();
+        assertNull(pagedViews.getNextPageToken());
+
+        String databaseName = "list_views_paged_globally_db";
+        String databaseName2 = "sample";
+        String databaseNamePattern = "list_views_paged_globally%";
+        String[] viewNames = {"view1", "view2", "view3", "abd", "def", "opr", "view_name"};
+        prepareDataForListViewsPagedGlobally(databaseName, databaseName2, viewNames);
+
+        Identifier[] expectedViewNames =
+                Arrays.stream(viewNames)
+                        .map(viewName -> Identifier.create(databaseName, viewName))
+                        .toArray(Identifier[]::new);
+        Identifier[] fullTableNames = Arrays.copyOf(expectedViewNames, viewNames.length + 1);
+        fullTableNames[viewNames.length] = Identifier.create(databaseName2, "view1");
+
+        pagedViews = catalog.listViewsPagedGlobally(databaseNamePattern, null, null, null);
+        assertEquals(expectedViewNames.length, pagedViews.getElements().size());
+        assertThat(pagedViews.getElements()).containsExactlyInAnyOrder(expectedViewNames);
+        assertNull(pagedViews.getNextPageToken());
+
+        assertListViewsPagedGloballyWithLoop(databaseNamePattern, expectedViewNames);
+        assertListViewsPagedGloballyWithLoop(null, fullTableNames);
+
+        assertListViewsPagedGloballyWithViewPattern(
+                databaseName, databaseNamePattern, expectedViewNames);
+    }
+
+    protected void prepareDataForListViewsPagedGlobally(
+            String databaseName, String databaseName2, String[] viewNames)
+            throws Catalog.DatabaseAlreadyExistException, Catalog.DatabaseNotExistException,
+                    Catalog.ViewAlreadyExistException {
+        catalog.createDatabase(databaseName, false);
+        catalog.createDatabase(databaseName2, false);
+
+        View view = buildView(databaseName);
+        for (String viewName : viewNames) {
+            catalog.createView(Identifier.create(databaseName, viewName), view, false);
+        }
+
+        catalog.createView(Identifier.create(databaseName2, "view1"), view, false);
+    }
+
+    protected void assertListViewsPagedGloballyWithLoop(
+            String databaseNamePattern, Identifier[] expectedViewNames) {
+        int maxResults = 2;
+        PagedList<Identifier> pagedViews;
+        List<Identifier> views = new ArrayList<>();
+        String pageToken = null;
+        do {
+            pagedViews =
+                    catalog.listViewsPagedGlobally(
+                            databaseNamePattern, null, maxResults, pageToken);
+            pageToken = pagedViews.getNextPageToken();
+            if (pagedViews.getElements() != null) {
+                views.addAll(pagedViews.getElements());
+            }
+            if (pageToken == null
+                    || pagedViews.getElements() == null
+                    || pagedViews.getElements().isEmpty()) {
+                break;
+            }
+        } while (StringUtils.isNotEmpty(pageToken));
+        assertEquals(expectedViewNames.length, views.size());
+        assertThat(views).containsExactlyInAnyOrder(expectedViewNames);
+        assertNull(pagedViews.getNextPageToken());
+    }
+
+    protected void assertListViewsPagedGloballyWithViewPattern(
+            String databaseName, String databaseNamePattern, Identifier[] expectedViewNames) {
+        int maxResults = 8;
+        PagedList<Identifier> pagedViews =
+                catalog.listViewsPagedGlobally(databaseNamePattern, null, maxResults, null);
+        assertEquals(
+                Math.min(maxResults, expectedViewNames.length), pagedViews.getElements().size());
+        assertThat(pagedViews.getElements()).containsExactlyInAnyOrder(expectedViewNames);
+        assertNull(pagedViews.getNextPageToken());
+
+        pagedViews = catalog.listViewsPagedGlobally(databaseNamePattern, "view%", null, null);
+        assertEquals(4, pagedViews.getElements().size());
+        assertThat(pagedViews.getElements())
+                .containsExactlyInAnyOrder(
+                        Identifier.create(databaseName, "view1"),
+                        Identifier.create(databaseName, "view2"),
+                        Identifier.create(databaseName, "view3"),
+                        Identifier.create(databaseName, "view_name"));
+        assertNull(pagedViews.getNextPageToken());
+
+        pagedViews = catalog.listViewsPagedGlobally(databaseNamePattern, "view_", null, null);
+        assertTrue(pagedViews.getElements().isEmpty());
+        assertNull(pagedViews.getNextPageToken());
+
+        pagedViews = catalog.listViewsPagedGlobally(databaseNamePattern, "view_%", null, null);
+        assertEquals(1, pagedViews.getElements().size());
+        assertThat(pagedViews.getElements())
+                .containsExactlyInAnyOrder(Identifier.create(databaseName, "view_name"));
+        assertNull(pagedViews.getNextPageToken());
+
+        Assertions.assertThrows(
+                BadRequestException.class,
+                () -> catalog.listViewsPagedGlobally(databaseNamePattern, "vi%ew", null, null));
+
+        Assertions.assertThrows(
+                BadRequestException.class,
+                () -> catalog.listViewsPagedGlobally(databaseNamePattern, "%view", null, null));
     }
 
     @Test
@@ -766,9 +1015,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         List<Partition> result = catalog.listPartitions(identifier);
         assertEquals(0, result.size());
         List<Map<String, String>> partitionSpecs =
-                Arrays.asList(
-                        Collections.singletonMap("dt", "20250101"),
-                        Collections.singletonMap("dt", "20250102"));
+                Arrays.asList(singletonMap("dt", "20250101"), singletonMap("dt", "20250102"));
         restCatalog.createBranch(identifier, branchName, null);
 
         BatchWriteBuilder writeBuilder = catalog.getTable(branchIdentifier).newBatchWriteBuilder();
@@ -793,27 +1040,36 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
     @Test
     void testListPartitions() throws Exception {
+        innerTestListPartitions(true);
+    }
+
+    @Test
+    void testListPartitionsNonMetastore() throws Exception {
+        innerTestListPartitions(false);
+    }
+
+    private void innerTestListPartitions(boolean metastore) throws Exception {
         if (!supportPartitions()) {
             return;
         }
         List<Map<String, String>> partitionSpecs =
                 Arrays.asList(
-                        Collections.singletonMap("dt", "20250101"),
-                        Collections.singletonMap("dt", "20250102"),
-                        Collections.singletonMap("dt", "20240102"),
-                        Collections.singletonMap("dt", "20260101"),
-                        Collections.singletonMap("dt", "20250104"),
-                        Collections.singletonMap("dt", "20250103"));
+                        singletonMap("dt", "20250101"),
+                        singletonMap("dt", "20250102"),
+                        singletonMap("dt", "20240102"),
+                        singletonMap("dt", "20260101"),
+                        singletonMap("dt", "20250104"),
+                        singletonMap("dt", "20250103"));
         Map[] sortedSpecs =
                 partitionSpecs.stream()
-                        .sorted(Comparator.comparing(i -> i.get("dt")))
+                        .sorted((o1, o2) -> o2.get("dt").compareTo(o1.get("dt")))
                         .toArray(Map[]::new);
 
-        String databaseName = "partitions_db";
+        String databaseName = "partitions_db" + metastore;
         Identifier identifier = Identifier.create(databaseName, "table");
         Schema schema =
                 Schema.newBuilder()
-                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(METASTORE_PARTITIONED_TABLE.key(), Boolean.toString(metastore))
                         .option(METASTORE_TAG_TO_PARTITION.key(), "dt")
                         .column("col", DataTypes.INT())
                         .column("dt", DataTypes.STRING())
@@ -833,7 +1089,12 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         }
 
         List<Partition> restPartitions = restCatalog.listPartitions(identifier);
-        assertThat(restPartitions.stream().map(Partition::spec)).containsExactly(sortedSpecs);
+        if (metastore) {
+            assertThat(restPartitions.stream().map(Partition::spec)).containsExactly(sortedSpecs);
+        } else {
+            assertThat(restPartitions.stream().map(Partition::spec))
+                    .containsExactlyInAnyOrder(sortedSpecs);
+        }
     }
 
     @Test
@@ -845,12 +1106,13 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         String databaseName = "partitions_paged_db";
         List<Map<String, String>> partitionSpecs =
                 Arrays.asList(
-                        Collections.singletonMap("dt", "20250101"),
-                        Collections.singletonMap("dt", "20250102"),
-                        Collections.singletonMap("dt", "20240102"),
-                        Collections.singletonMap("dt", "20260101"),
-                        Collections.singletonMap("dt", "20250104"),
-                        Collections.singletonMap("dt", "20250103"));
+                        singletonMap("dt", "20250101"),
+                        singletonMap("dt", "20250102"),
+                        singletonMap("dt", "20240102"),
+                        singletonMap("dt", "20260101"),
+                        singletonMap("dt", "20250104"),
+                        singletonMap("dt", "20250103"),
+                        singletonMap("dt", "2025010_test"));
         catalog.dropDatabase(databaseName, true, true);
         catalog.createDatabase(databaseName, true);
         Identifier identifier = Identifier.create(databaseName, "table");
@@ -882,34 +1144,31 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
                 catalog.listPartitionsPaged(identifier, null, null, null);
         Map[] sortedSpecs =
                 partitionSpecs.stream()
-                        .sorted(Comparator.comparing(i -> i.get("dt")))
+                        .sorted((o1, o2) -> o2.get("dt").compareTo(o1.get("dt")))
                         .toArray(Map[]::new);
         assertPagedPartitions(pagedPartitions, partitionSpecs.size(), sortedSpecs);
 
         int maxResults = 2;
         pagedPartitions = catalog.listPartitionsPaged(identifier, maxResults, null, null);
-        assertPagedPartitions(
-                pagedPartitions, maxResults, partitionSpecs.get(2), partitionSpecs.get(0));
-        assertEquals("dt=20250101", pagedPartitions.getNextPageToken());
+        assertPagedPartitions(pagedPartitions, maxResults, sortedSpecs[0], sortedSpecs[1]);
+        assertEquals(sortedSpecs[1].toString(), "{" + pagedPartitions.getNextPageToken() + "}");
 
         pagedPartitions =
                 catalog.listPartitionsPaged(
                         identifier, maxResults, pagedPartitions.getNextPageToken(), null);
-        assertPagedPartitions(
-                pagedPartitions, maxResults, partitionSpecs.get(1), partitionSpecs.get(5));
-        assertEquals("dt=20250103", pagedPartitions.getNextPageToken());
+        assertPagedPartitions(pagedPartitions, maxResults, sortedSpecs[2], sortedSpecs[3]);
+        assertEquals(sortedSpecs[3].toString(), "{" + pagedPartitions.getNextPageToken() + "}");
 
         pagedPartitions =
                 catalog.listPartitionsPaged(
                         identifier, maxResults, pagedPartitions.getNextPageToken(), null);
-        assertPagedPartitions(
-                pagedPartitions, maxResults, partitionSpecs.get(4), partitionSpecs.get(3));
-        assertEquals("dt=20260101", pagedPartitions.getNextPageToken());
+        assertPagedPartitions(pagedPartitions, maxResults, sortedSpecs[4], sortedSpecs[5]);
+        assertEquals(sortedSpecs[5].toString(), "{" + pagedPartitions.getNextPageToken() + "}");
 
         pagedPartitions =
                 catalog.listPartitionsPaged(
                         identifier, maxResults, pagedPartitions.getNextPageToken(), null);
-        assertThat(pagedPartitions.getElements()).isEmpty();
+        assertPagedPartitions(pagedPartitions, 1, sortedSpecs[6]);
         assertNull(pagedPartitions.getNextPageToken());
 
         maxResults = 8;
@@ -926,29 +1185,19 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         pagedPartitions = catalog.listPartitionsPaged(identifier, maxResults, null, "dt=2025%");
         assertPagedPartitions(
                 pagedPartitions,
-                4,
-                partitionSpecs.get(0),
-                partitionSpecs.get(1),
+                5,
+                partitionSpecs.get(6),
+                partitionSpecs.get(4),
                 partitionSpecs.get(5),
-                partitionSpecs.get(4));
+                partitionSpecs.get(1),
+                partitionSpecs.get(0));
+        assertNull(pagedPartitions.getNextPageToken());
+
+        pagedPartitions = catalog.listPartitionsPaged(identifier, maxResults, null, "dt=2025010_%");
+        assertPagedPartitions(pagedPartitions, 1, partitionSpecs.get(6));
         assertNull(pagedPartitions.getNextPageToken());
 
         pagedPartitions = catalog.listPartitionsPaged(identifier, maxResults, null, "dt=2025010_");
-        assertPagedPartitions(
-                pagedPartitions,
-                4,
-                partitionSpecs.get(0),
-                partitionSpecs.get(1),
-                partitionSpecs.get(5),
-                partitionSpecs.get(4));
-        assertNull(pagedPartitions.getNextPageToken());
-
-        pagedPartitions =
-                catalog.listPartitionsPaged(identifier, maxResults, null, "dt=2025010\\_");
-        assertTrue(pagedPartitions.getElements().isEmpty());
-        assertNull(pagedPartitions.getNextPageToken());
-
-        pagedPartitions = catalog.listPartitionsPaged(identifier, maxResults, null, "dt=202501_");
         assertTrue(pagedPartitions.getElements().isEmpty());
         assertNull(pagedPartitions.getNextPageToken());
 
@@ -958,7 +1207,61 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
         assertThrows(
                 BadRequestException.class,
-                () -> catalog.listPartitionsPaged(identifier, null, null, "dt=_0101"));
+                () -> catalog.listPartitionsPaged(identifier, null, null, "dt=01%01"));
+    }
+
+    @Test
+    public void testListPartitionsPagedWithMultiLevel() throws Exception {
+        if (!supportPartitions()) {
+            return;
+        }
+
+        String databaseName = "partitions_paged_db";
+        Map<String, String> partitionSpec =
+                new HashMap<String, String>() {
+                    {
+                        put("dt", "20250101");
+                        put("col", "0");
+                    }
+                };
+
+        Map<String, String> partitionSpec2 =
+                new HashMap<String, String>() {
+                    {
+                        put("dt", "20250102");
+                        put("col", "0");
+                    }
+                };
+        List<Map<String, String>> partitionSpecs = Arrays.asList(partitionSpec, partitionSpec2);
+        catalog.dropDatabase(databaseName, true, true);
+        catalog.createDatabase(databaseName, true);
+        Identifier identifier = Identifier.create(databaseName, "table");
+
+        catalog.createTable(
+                identifier,
+                Schema.newBuilder()
+                        .option(METASTORE_PARTITIONED_TABLE.key(), "true")
+                        .option(METASTORE_TAG_TO_PARTITION.key(), "dt")
+                        .column("col", DataTypes.INT())
+                        .column("dt", DataTypes.STRING())
+                        .partitionKeys("dt", "col")
+                        .build(),
+                true);
+
+        BatchWriteBuilder writeBuilder = catalog.getTable(identifier).newBatchWriteBuilder();
+        try (BatchTableWrite write = writeBuilder.newWrite();
+                BatchTableCommit commit = writeBuilder.newCommit()) {
+            for (Map<String, String> partition : partitionSpecs) {
+                write.write(GenericRow.of(0, BinaryString.fromString(partition.get("dt"))));
+            }
+            commit.commit(write.prepareCommit());
+        }
+        PagedList<Partition> pagedPartitions =
+                catalog.listPartitionsPaged(identifier, null, null, "dt=20250101/col=0");
+        assertPagedPartitions(pagedPartitions, 1, partitionSpecs.get(0));
+
+        pagedPartitions = catalog.listPartitionsPaged(identifier, null, null, "dt=20250102%");
+        assertPagedPartitions(pagedPartitions, 1, partitionSpecs.get(1));
     }
 
     @Test
@@ -1020,10 +1323,21 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
                 () ->
                         restCatalog.commitSnapshot(
                                 hasSnapshotTableIdentifier,
+                                "",
                                 createSnapshotWithMillis(1L, System.currentTimeMillis()),
-                                new ArrayList<PartitionStatistics>()));
+                                new ArrayList<>()));
 
         createTable(hasSnapshotTableIdentifier, Maps.newHashMap(), Lists.newArrayList("col1"));
+
+        assertThrows(
+                Catalog.TableNotExistException.class,
+                () ->
+                        restCatalog.commitSnapshot(
+                                hasSnapshotTableIdentifier,
+                                "unknown_id",
+                                createSnapshotWithMillis(1L, System.currentTimeMillis()),
+                                new ArrayList<>()));
+
         long id = 10086;
         long millis = System.currentTimeMillis();
         updateSnapshotOnRestServer(
@@ -1212,11 +1526,16 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         int maxResults = 2;
         AtomicInteger fetchTimes = new AtomicInteger(0);
         List<Integer> fetchData =
-                restCatalog.listDataFromPageApi(
-                        queryParams -> {
-                            return generateTestPagedResponse(
-                                    queryParams, testData, maxResults, fetchTimes, true);
-                        });
+                restCatalog
+                        .api()
+                        .listDataFromPageApi(
+                                queryParams ->
+                                        generateTestPagedResponse(
+                                                queryParams,
+                                                testData,
+                                                maxResults,
+                                                fetchTimes,
+                                                true));
         assertEquals(fetchTimes.get(), 4);
         assertThat(fetchData).containsSequence(testData);
     }
@@ -1227,11 +1546,13 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         int maxResults = 2;
         AtomicInteger fetchTimes = new AtomicInteger(0);
         List<Integer> fetchData =
-                restCatalog.listDataFromPageApi(
-                        queryParams -> {
-                            return generateTestPagedResponse(
-                                    queryParams, testData, maxResults, fetchTimes, false);
-                        });
+                restCatalog
+                        .api()
+                        .listDataFromPageApi(
+                                queryParams -> {
+                                    return generateTestPagedResponse(
+                                            queryParams, testData, maxResults, fetchTimes, false);
+                                });
 
         assertEquals(fetchTimes.get(), testData.size() / maxResults + 1);
         assertThat(fetchData).containsSequence(testData);
@@ -1309,6 +1630,355 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
                                 false));
     }
 
+    @Test
+    void testFunction() throws Exception {
+        Identifier identifierWithSlash = new Identifier("rest_catalog_db", "function/");
+        catalog.createDatabase(identifierWithSlash.getDatabaseName(), false);
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        catalog.createFunction(
+                                identifierWithSlash,
+                                MockRESTMessage.function(identifierWithSlash),
+                                false));
+        assertThrows(
+                Catalog.FunctionNotExistException.class,
+                () -> catalog.getFunction(identifierWithSlash));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> catalog.dropFunction(identifierWithSlash, true));
+
+        Identifier identifierWithoutAlphabet = new Identifier("rest_catalog_db", "-");
+        assertThrows(
+                IllegalArgumentException.class,
+                () ->
+                        catalog.createFunction(
+                                identifierWithoutAlphabet,
+                                MockRESTMessage.function(identifierWithoutAlphabet),
+                                false));
+        assertThrows(
+                Catalog.FunctionNotExistException.class,
+                () -> catalog.getFunction(identifierWithoutAlphabet));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> catalog.dropFunction(identifierWithoutAlphabet, true));
+
+        Identifier identifier = Identifier.fromString("rest_catalog_db.function.na_me-01");
+        Function function = MockRESTMessage.function(identifier);
+
+        catalog.createFunction(identifier, function, true);
+        assertThrows(
+                Catalog.FunctionAlreadyExistException.class,
+                () -> catalog.createFunction(identifier, function, false));
+
+        assertThat(catalog.listFunctions(identifier.getDatabaseName()).contains(function.name()))
+                .isTrue();
+
+        Function getFunction = catalog.getFunction(identifier);
+        assertThat(getFunction.name()).isEqualTo(function.name());
+        for (String dialect : function.definitions().keySet()) {
+            assertThat(getFunction.definition(dialect)).isEqualTo(function.definition(dialect));
+        }
+        catalog.dropFunction(identifier, true);
+
+        assertThat(catalog.listFunctions(identifier.getDatabaseName()).contains(function.name()))
+                .isFalse();
+        assertThrows(
+                Catalog.FunctionNotExistException.class,
+                () -> catalog.dropFunction(identifier, false));
+        assertThrows(
+                Catalog.FunctionNotExistException.class, () -> catalog.getFunction(identifier));
+    }
+
+    @Test
+    void testListFunctions() throws Exception {
+        String db1 = "db_rest_catalog_db";
+        String db2 = "db2_rest_catalog";
+        Identifier identifier = new Identifier(db1, "list_function");
+        Identifier identifier1 = new Identifier(db1, "function");
+        Identifier identifier2 = new Identifier(db2, "list_function");
+        Identifier identifier3 = new Identifier(db2, "function");
+        catalog.createDatabase(db1, false);
+        catalog.createDatabase(db2, false);
+        catalog.createFunction(identifier, MockRESTMessage.function(identifier), true);
+        catalog.createFunction(identifier1, MockRESTMessage.function(identifier1), true);
+        catalog.createFunction(identifier2, MockRESTMessage.function(identifier2), true);
+        catalog.createFunction(identifier3, MockRESTMessage.function(identifier3), true);
+        assertThat(catalog.listFunctionsPaged(db1, null, null, null).getElements())
+                .containsExactlyInAnyOrder(identifier.getObjectName(), identifier1.getObjectName());
+        assertThat(catalog.listFunctionsPaged(db1, 1, null, null).getElements())
+                .containsAnyOf(identifier.getObjectName(), identifier1.getObjectName());
+        assertThat(
+                        catalog.listFunctionsPaged(db1, 1, identifier1.getObjectName(), null)
+                                .getElements())
+                .containsExactlyInAnyOrder(identifier.getObjectName());
+        assertThat(catalog.listFunctionsPaged(db1, null, null, "func%").getElements())
+                .containsExactlyInAnyOrder(identifier1.getObjectName());
+        assertThat(
+                        catalog.listFunctionsPagedGlobally("db2_rest%", "func%", null, null)
+                                .getElements())
+                .containsExactlyInAnyOrder(identifier3);
+        assertThat(catalog.listFunctionsPagedGlobally("db2_rest%", null, 1, null).getElements())
+                .containsAnyOf(identifier2, identifier3);
+        assertThat(
+                        catalog.listFunctionsPagedGlobally(
+                                        "db2_rest%", null, 1, identifier3.getFullName())
+                                .getElements())
+                .containsExactlyInAnyOrder(identifier2);
+
+        assertThat(
+                        catalog.listFunctionDetailsPaged(db1, 1, null, null).getElements().stream()
+                                .map(f -> f.fullName())
+                                .collect(Collectors.toList()))
+                .containsAnyOf(identifier.getFullName(), identifier1.getFullName());
+
+        assertThat(
+                        catalog.listFunctionDetailsPaged(db2, 4, null, "func%").getElements()
+                                .stream()
+                                .map(f -> f.fullName())
+                                .collect(Collectors.toList()))
+                .containsExactly(identifier3.getFullName());
+
+        assertThat(
+                        catalog.listFunctionDetailsPaged(db2, 1, identifier3.getObjectName(), null)
+                                .getElements().stream()
+                                .map(f -> f.fullName())
+                                .collect(Collectors.toList()))
+                .contains(identifier2.getFullName());
+    }
+
+    @Test
+    void testAlterFunction() throws Exception {
+        Identifier identifier = new Identifier("rest_catalog_db", "alter_function_name");
+        catalog.createDatabase(identifier.getDatabaseName(), false);
+        Function function = MockRESTMessage.function(identifier);
+        FunctionDefinition definition = FunctionDefinition.sql("x * y + 1");
+        FunctionChange.AddDefinition addDefinition =
+                (FunctionChange.AddDefinition) FunctionChange.addDefinition("flink_1", definition);
+        assertDoesNotThrow(
+                () -> catalog.alterFunction(identifier, ImmutableList.of(addDefinition), true));
+        assertThrows(
+                Catalog.FunctionNotExistException.class,
+                () -> catalog.alterFunction(identifier, ImmutableList.of(addDefinition), false));
+        catalog.createFunction(identifier, function, true);
+        // set options
+        String key = UUID.randomUUID().toString();
+        String value = UUID.randomUUID().toString();
+        FunctionChange setOption = FunctionChange.setOption(key, value);
+        catalog.alterFunction(identifier, ImmutableList.of(setOption), false);
+        Function catalogFunction = catalog.getFunction(identifier);
+        assertThat(catalogFunction.options().get(key)).isEqualTo(value);
+
+        // remove options
+        catalog.alterFunction(
+                identifier, ImmutableList.of(FunctionChange.removeOption(key)), false);
+        catalogFunction = catalog.getFunction(identifier);
+        assertThat(catalogFunction.options().containsKey(key)).isEqualTo(false);
+
+        // update comment
+        String newComment = "new comment";
+        catalog.alterFunction(
+                identifier, ImmutableList.of(FunctionChange.updateComment(newComment)), false);
+        catalogFunction = catalog.getFunction(identifier);
+        assertThat(catalogFunction.comment()).isEqualTo(newComment);
+        // add definition
+        catalog.alterFunction(identifier, ImmutableList.of(addDefinition), false);
+        catalogFunction = catalog.getFunction(identifier);
+        assertThat(catalogFunction.definition(addDefinition.name()))
+                .isEqualTo(addDefinition.definition());
+        assertThrows(
+                Catalog.DefinitionAlreadyExistException.class,
+                () -> catalog.alterFunction(identifier, ImmutableList.of(addDefinition), false));
+
+        // update definition
+        FunctionChange.UpdateDefinition updateDefinition =
+                (FunctionChange.UpdateDefinition)
+                        FunctionChange.updateDefinition("flink_1", definition);
+        catalog.alterFunction(identifier, ImmutableList.of(updateDefinition), false);
+        catalogFunction = catalog.getFunction(identifier);
+        assertThat(catalogFunction.definition(updateDefinition.name()))
+                .isEqualTo(updateDefinition.definition());
+        assertThrows(
+                Catalog.DefinitionNotExistException.class,
+                () ->
+                        catalog.alterFunction(
+                                identifier,
+                                ImmutableList.of(
+                                        FunctionChange.updateDefinition("no_exist", definition)),
+                                false));
+
+        // drop dialect
+        FunctionChange.DropDefinition dropDefinition =
+                (FunctionChange.DropDefinition)
+                        FunctionChange.dropDefinition(updateDefinition.name());
+        catalog.alterFunction(identifier, ImmutableList.of(dropDefinition), false);
+        catalogFunction = catalog.getFunction(identifier);
+        assertThat(catalogFunction.definition(updateDefinition.name())).isNull();
+
+        assertThrows(
+                Catalog.DefinitionNotExistException.class,
+                () -> catalog.alterFunction(identifier, ImmutableList.of(dropDefinition), false));
+    }
+
+    @Test
+    public void testValidateFunctionName() throws Exception {
+        assertDoesNotThrow(() -> RESTFunctionValidator.checkFunctionName("a"));
+        assertDoesNotThrow(() -> RESTFunctionValidator.checkFunctionName("a1_"));
+        assertDoesNotThrow(() -> RESTFunctionValidator.checkFunctionName("a-b_c"));
+        assertDoesNotThrow(() -> RESTFunctionValidator.checkFunctionName("a-b_c.1"));
+
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RESTFunctionValidator.checkFunctionName("a\\/b"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RESTFunctionValidator.checkFunctionName("a$?b"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RESTFunctionValidator.checkFunctionName("a@b"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RESTFunctionValidator.checkFunctionName("a*b"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RESTFunctionValidator.checkFunctionName("123"));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RESTFunctionValidator.checkFunctionName("_-"));
+        assertThrows(
+                IllegalArgumentException.class, () -> RESTFunctionValidator.checkFunctionName(""));
+        assertThrows(
+                IllegalArgumentException.class,
+                () -> RESTFunctionValidator.checkFunctionName(null));
+    }
+
+    @Test
+    void testTableAuth() throws Exception {
+        Identifier identifier = Identifier.create("test_table_db", "auth_table");
+        catalog.createDatabase(identifier.getDatabaseName(), true);
+        catalog.createTable(
+                identifier,
+                new Schema(
+                        Lists.newArrayList(
+                                new DataField(0, "col1", DataTypes.INT()),
+                                new DataField(1, "col2", DataTypes.INT())),
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        singletonMap(QUERY_AUTH_ENABLED.key(), "true"),
+                        ""),
+                true);
+        authTableColumns(identifier, singletonList("col2"));
+        Table table = catalog.getTable(identifier);
+
+        assertThatThrownBy(() -> table.newReadBuilder().newScan().plan())
+                .hasMessageContaining("Table test_table_db.auth_table has no permission.");
+
+        // no exception
+        table.newReadBuilder().withProjection(new int[] {1}).newScan().plan();
+    }
+
+    @Test
+    void testSnapshotMethods() throws Exception {
+        Identifier identifier = Identifier.create("test_table_db", "snapshots_table");
+        catalog.createDatabase(identifier.getDatabaseName(), true);
+        catalog.createTable(
+                identifier,
+                new Schema(
+                        Lists.newArrayList(new DataField(0, "col", DataTypes.INT())),
+                        Collections.emptyList(),
+                        Collections.emptyList(),
+                        emptyMap(),
+                        ""),
+                true);
+        Table table = catalog.getTable(identifier);
+
+        assertThat(catalog.loadSnapshot(identifier, "EARLIEST")).isEmpty();
+        assertThat(catalog.loadSnapshot(identifier, "LATEST")).isEmpty();
+
+        batchWrite(table, singletonList(1));
+        batchWrite(table, singletonList(1));
+        batchWrite(table, singletonList(1));
+        batchWrite(table, singletonList(1));
+
+        assertThat(catalog.listSnapshotsPaged(identifier, null, null).getElements())
+                .containsExactlyInAnyOrder(
+                        table.snapshot(1), table.snapshot(2), table.snapshot(3), table.snapshot(4));
+
+        assertThat(catalog.loadSnapshot(identifier, "3"))
+                .isPresent()
+                .get()
+                .isEqualTo(table.snapshot(3));
+
+        assertThat(catalog.loadSnapshot(identifier, "EARLIEST"))
+                .isPresent()
+                .get()
+                .isEqualTo(table.snapshot(1));
+
+        assertThat(catalog.loadSnapshot(identifier, "8")).isEmpty();
+
+        assertThat(catalog.loadSnapshot(identifier, "LATEST"))
+                .isPresent()
+                .get()
+                .isEqualTo(table.snapshot(4));
+
+        table.createTag("MY_TAG", 2);
+        assertThat(catalog.loadSnapshot(identifier, "MY_TAG"))
+                .isPresent()
+                .get()
+                .isEqualTo(table.snapshot(2));
+
+        assertThat(catalog.loadSnapshot(identifier, "NONE_TAG")).isEmpty();
+
+        assertThat(catalog.loadSnapshot(identifier, "15")).isEmpty();
+
+        // test more snapshots
+        for (int i = 0; i < 10; i++) {
+            batchWrite(table, singletonList(1));
+        }
+        RESTApi api = ((RESTCatalog) catalog).api();
+        List<Snapshot> snapshots =
+                PagedList.listAllFromPagedApi(
+                        token -> api.listSnapshotsPaged(identifier, null, token));
+        assertThat(snapshots)
+                .containsExactlyInAnyOrder(
+                        table.snapshot(1),
+                        table.snapshot(2),
+                        table.snapshot(3),
+                        table.snapshot(4),
+                        table.snapshot(5),
+                        table.snapshot(6),
+                        table.snapshot(7),
+                        table.snapshot(8),
+                        table.snapshot(9),
+                        table.snapshot(10),
+                        table.snapshot(11),
+                        table.snapshot(12),
+                        table.snapshot(13),
+                        table.snapshot(14));
+
+        // expire snapshots
+        SnapshotManager snapshotManager = ((FileStoreTable) table).snapshotManager();
+        snapshotManager.deleteSnapshot(1);
+        snapshotManager.deleteSnapshot(2);
+        snapshots =
+                PagedList.listAllFromPagedApi(
+                        token -> api.listSnapshotsPaged(identifier, null, token));
+        assertThat(snapshots)
+                .containsExactlyInAnyOrder(
+                        table.snapshot(3),
+                        table.snapshot(4),
+                        table.snapshot(5),
+                        table.snapshot(6),
+                        table.snapshot(7),
+                        table.snapshot(8),
+                        table.snapshot(9),
+                        table.snapshot(10),
+                        table.snapshot(11),
+                        table.snapshot(12),
+                        table.snapshot(13),
+                        table.snapshot(14));
+    }
+
     private TestPagedResponse generateTestPagedResponse(
             Map<String, String> queryParams,
             List<Integer> testData,
@@ -1341,7 +2011,6 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
     @Override
     protected boolean supportPartitions() {
-        // TODO support this
         return true;
     }
 
@@ -1384,6 +2053,8 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
 
     protected abstract void revokeTablePermission(Identifier identifier);
 
+    protected abstract void authTableColumns(Identifier identifier, List<String> columns);
+
     protected abstract void revokeDatabasePermission(String database);
 
     protected abstract RESTToken getDataTokenFromRestServer(Identifier identifier);
@@ -1401,8 +2072,8 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
             long fileCount,
             long lastFileCreationTime);
 
-    protected void batchWrite(FileStoreTable tableTestWrite, List<Integer> data) throws Exception {
-        BatchWriteBuilder writeBuilder = tableTestWrite.newBatchWriteBuilder();
+    protected void batchWrite(Table table, List<Integer> data) throws Exception {
+        BatchWriteBuilder writeBuilder = table.newBatchWriteBuilder();
         BatchTableWrite write = writeBuilder.newWrite();
         for (Integer i : data) {
             GenericRow record = GenericRow.of(i);
@@ -1415,8 +2086,8 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         commit.close();
     }
 
-    protected List<String> batchRead(FileStoreTable tableTestWrite) throws IOException {
-        ReadBuilder readBuilder = tableTestWrite.newReadBuilder();
+    protected List<String> batchRead(Table table) throws IOException {
+        ReadBuilder readBuilder = table.newReadBuilder();
         List<Split> splits = readBuilder.newScan().plan().splits();
         TableRead read = readBuilder.newRead();
         RecordReader<InternalRow> reader = read.createReader(splits);
@@ -1436,7 +2107,7 @@ public abstract class RESTCatalogTest extends CatalogTestBase {
         String expiration = now.format(TOKEN_DATE_FORMATTER);
         String secret = UUID.randomUUID().toString();
         DLFToken token = new DLFToken("accessKeyId", secret, "securityToken", expiration);
-        String tokenStr = RESTObjectMapper.OBJECT_MAPPER.writeValueAsString(token);
+        String tokenStr = RESTApi.toJson(token);
         FileUtils.writeStringToFile(tokenFile, tokenStr);
     }
 }

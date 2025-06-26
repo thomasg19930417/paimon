@@ -102,7 +102,10 @@ public class ExpireSnapshotsImpl implements ExpireSnapshots {
         }
 
         Preconditions.checkArgument(
-                retainMax >= retainMin, "retainMax must greater than retainMin.");
+                retainMax >= retainMin,
+                String.format(
+                        "retainMax (%s) must not be less than retainMin (%s).",
+                        retainMax, retainMin));
 
         // the min snapshot to retain from 'snapshot.num-retained.max'
         // (the maximum number of snapshots to retain)
@@ -135,6 +138,8 @@ public class ExpireSnapshotsImpl implements ExpireSnapshots {
 
     @VisibleForTesting
     public int expireUntil(long earliestId, long endExclusiveId) {
+        long startTime = System.currentTimeMillis();
+
         if (endExclusiveId <= earliestId) {
             // No expire happens:
             // write the hint file in order to see the earliest snapshot directly next time
@@ -156,11 +161,6 @@ public class ExpireSnapshotsImpl implements ExpireSnapshots {
                 beginInclusiveId = id + 1;
                 break;
             }
-        }
-
-        if (LOG.isDebugEnabled()) {
-            LOG.debug(
-                    "Snapshot expire range is [" + beginInclusiveId + ", " + endExclusiveId + ")");
         }
 
         List<Snapshot> taggedSnapshots = tagManager.taggedSnapshots();
@@ -269,6 +269,12 @@ public class ExpireSnapshotsImpl implements ExpireSnapshots {
         }
 
         writeEarliestHint(endExclusiveId);
+        long duration = System.currentTimeMillis() - startTime;
+        LOG.info(
+                "Finished expire snapshots, duration {} ms, range is [{}, {})",
+                duration,
+                beginInclusiveId,
+                endExclusiveId);
         return (int) (endExclusiveId - beginInclusiveId);
     }
 
